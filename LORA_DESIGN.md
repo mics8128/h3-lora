@@ -172,6 +172,20 @@ buffers instead of mutating file-backed originals, which can increase RSS.
 The wall-time figures include loading/composition and are not evidence of
 Turbo acceleration. The Turbo artifact's missing-AdaLN warning still applies.
 
+The reviewed implementation also generated a combined-stack 243-frame clip
+(10.125 seconds) at 512x512 and eight Euler steps. It fully decoded, and
+representative frames retained the requested fully clothed park scene. Process
+wall time was 305.83 seconds, maximum RSS 36,015,472,640 bytes, peak physical
+footprint 25,307,546,096 bytes, and reported process swaps zero. These are
+distinct accounting metrics, not additive memory totals.
+
+Decoded RGB video and decoded audio hashes were identical between the unchanged
+upstream executable, this fork without adapters, and this fork with a disabled
+missing-path adapter (`-0` strength), for the same 256-square/22-frame/four-step
+fox scenario. No-adapter SSD streaming also generated decodable media; its
+BF16 execution is not expected to match the default M5 int8 bytes. Malformed,
+missing, NaN, infinite and trailing-junk CLI strengths were rejected.
+
 No weights, merged weights, model-derived numeric fixtures, generated videos,
 credentials, private paths or private assets belong in public commits. Only
 synthetic fixtures, generic code and redacted verification records are
