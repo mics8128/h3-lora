@@ -13,6 +13,7 @@ struct h3_lora_stack;
 struct h3_ctx {
     char *model_dir;
     struct h3_lora_stack *loras;
+    h3_lora_model lora_target;
     char error[512];
     h3_device_info device;
     h3_model_info model;

@@ -2,6 +2,7 @@
 #define H3_DIT_H
 
 #include "h3_gpu.h"
+#include "h3.h"
 #include "h3_host.h"
 #include "h3_text_encoder.h"
 #include "h3_lora.h"
@@ -99,11 +100,13 @@ int h3_dit_forward(h3_dit *dit, int step,
                    float *video_velocity, float *audio_velocity,
                    char *error, size_t error_size);
 
-/* Run every configured RES multistep update in place. Solver state remains
- * F32 between transformer evaluations, matching the released MLX path. */
-int h3_dit_denoise(h3_dit *dit, float *video_latent, float *audio_latent,
-                   h3_dit_progress progress, void *progress_opaque,
-                   char *error, size_t error_size);
+/* Packed-AV video-clock sampling. History and seeded LCM noise are run-local. */
+int h3_dit_denoise_simple_preview(h3_dit *dit, h3_sampler_kind kind,
+    uint64_t seed, float video_shift, float audio_shift,
+    float *video_latent, float *audio_latent,
+    h3_dit_progress progress, void *progress_opaque,
+    h3_dit_preview preview, void *preview_opaque,
+    char *error, size_t error_size);
 
 /* Current serving sampler: independent video/audio shifted Euler grids. */
 int h3_dit_denoise_euler(h3_dit *dit, float *video_latent,

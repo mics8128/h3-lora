@@ -20,6 +20,12 @@ extern "C" {
 typedef struct h3_ctx h3_ctx;
 typedef struct h3_result h3_result;
 
+typedef enum { H3_SAMPLER_EULER = 0, H3_SAMPLER_LCM = 1,
+               H3_SAMPLER_RES_MULTISTEP = 2 } h3_sampler_kind;
+typedef enum { H3_SCHEDULER_SERVING = 0,
+               H3_SCHEDULER_SIMPLE = 1 } h3_scheduler_kind;
+typedef enum { H3_LORA_FL2VA = 0, H3_LORA_REF2VA = 1 } h3_lora_model;
+
 typedef struct {
     size_t embedding_entries;
     size_t embedding_bytes;
@@ -126,12 +132,17 @@ typedef struct {
     h3_frame_callback on_frame;
     h3_progress_callback on_progress;
     void *callback_opaque;
+    h3_sampler_kind sampler;
+    h3_scheduler_kind scheduler;
+    float video_shift;
+    float audio_shift;
 } h3_params;
 
 #define H3_PARAMS_DEFAULT { \
     H3_DEFAULT_WIDTH, H3_DEFAULT_HEIGHT, H3_DEFAULT_FRAMES, H3_DEFAULT_STEPS, \
     UINT64_C(42), NULL, NULL, NULL, NULL, 0, H3_REFERENCE_IMAGE_MATCH, \
-    1, H3_DEFAULT_DIT_LAYERS, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, NULL, NULL, NULL \
+    1, H3_DEFAULT_DIT_LAYERS, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, NULL, NULL, NULL, \
+    H3_SAMPLER_EULER, H3_SCHEDULER_SERVING, 12.0f, 3.0f \
 }
 
 typedef struct {
@@ -177,7 +188,7 @@ typedef struct {
 /* Load metadata, snapshot active adapters, then initialize Metal. Base model
  * payloads remain unloaded. Input specifications are borrowed during this call. */
 h3_ctx *h3_load_dir(const char *model_dir, const h3_lora_spec *loras,
-                    size_t lora_count);
+                    size_t lora_count, h3_lora_model target);
 /* Context-owned active specifications in canonical order, valid until free. */
 const h3_lora_spec *h3_get_loras(const h3_ctx *ctx, size_t *count);
 void h3_free(h3_ctx *ctx);

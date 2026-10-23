@@ -1583,8 +1583,8 @@ int main(int argc, char **argv) {
     if (!h3_layout_build(&spec, &layout, error, sizeof(error)) ||
         !((sampler_ab || token_reduction_ab || cross_adaln_ab ||
            final_slice_ab || final_head_ab || qkv_denoise_ab || qkv_step_ab)
-              ? h3_serving_schedule_build(20, &sigmas)
-              : h3_schedule_build(20, &sigmas)))
+              ? h3_serving_schedule_build(20, 12.0f, 3.0f, &sigmas)
+              : h3_schedule_build(20, 12.0f, 3.0f, &sigmas)))
         die("cannot build benchmark layout");
     char weights[1024];
     snprintf(weights, sizeof(weights), "%s/%s/transformer", model_root,

@@ -37,7 +37,11 @@ static void usage(const char *program) {
         "      --core-reuse N     Core refresh: 1 exact, 4 fast, 6 aggressive\n"
         "      --token-reduction  Pair video tokens in middle DiT blocks\n"
         "      --ssd-streaming    Stream original BF16 DiT layers from SSD\n"
-        "      --lora PATH STRENGTH  Add immutable FL2VA adapter (repeatable)\n"
+        "      --lora PATH STRENGTH  Add immutable adapter (repeatable)\n"
+        "      --lora-model fl2va|ref2va  Immutable adapter target (default fl2va)\n"
+        "      --sampler euler|lcm|res_multistep  Default euler\n"
+        "      --scheduler serving|simple  Default serving; serving requires Euler\n"
+        "      --video-shift FLOAT --audio-shift FLOAT  Defaults 12 and 3\n"
         "      --use-int8-row-fc2 Faster one-scale int8 FC2 (M5)\n"
         "      --use-reference-rope  Disable native 256 RoPE adaptation\n"
         "      --use-slower-bf16-mlp  Force close-reference BF16/MPS MLP\n"
@@ -77,6 +81,17 @@ static int parse_int(const char *value, const char *label) {
         exit(2);
     }
     return (int)parsed;
+}
+
+static float parse_shift(const char *value) {
+    char *end = NULL;
+    errno = 0;
+    float shift = strtof(value, &end);
+    if (errno || end == value || *end || !isfinite(shift) || shift <= 0.0f) {
+        fprintf(stderr, "h3: shift must be finite and positive: %s\n", value);
+        exit(2);
+    }
+    return shift;
 }
 
 static int frames_from_seconds(const char *value) {
@@ -258,7 +273,8 @@ int main(int argc, char **argv) {
            OPT_FIRST, OPT_LAST, OPT_REF_IMAGE, OPT_REF_IMAGE_SIZE,
            OPT_REF_VIDEO, OPT_REF_SILENT_VIDEO, OPT_REF_VIDEO_AUDIO,
            OPT_REF_AUDIO, OPT_FRAMES_DIR, OPT_SHOW, OPT_ZOOM,
-           OPT_PROFILE, OPT_INFO, OPT_LORA };
+           OPT_PROFILE, OPT_INFO, OPT_LORA, OPT_LORA_MODEL, OPT_SAMPLER,
+           OPT_SCHEDULER, OPT_VIDEO_SHIFT, OPT_AUDIO_SHIFT };
     static const struct option options[] = {
         {"model-dir", required_argument, NULL, 'd'},
         {"prompt", required_argument, NULL, 'p'},
@@ -276,6 +292,11 @@ int main(int argc, char **argv) {
         {"token-reduction", no_argument, NULL, OPT_TOKEN_REDUCTION},
         {"ssd-streaming", no_argument, NULL, OPT_SSD_STREAMING},
         {"lora", required_argument, NULL, OPT_LORA},
+        {"lora-model", required_argument, NULL, OPT_LORA_MODEL},
+        {"sampler", required_argument, NULL, OPT_SAMPLER},
+        {"scheduler", required_argument, NULL, OPT_SCHEDULER},
+        {"video-shift", required_argument, NULL, OPT_VIDEO_SHIFT},
+        {"audio-shift", required_argument, NULL, OPT_AUDIO_SHIFT},
         {"use-int8-row-fc2", no_argument, NULL, OPT_USE_INT8_ROW_FC2},
         {"use-reference-rope", no_argument, NULL, OPT_USE_REFERENCE_ROPE},
         {"use-slower-bf16-mlp", no_argument, NULL,
@@ -319,6 +340,7 @@ int main(int argc, char **argv) {
     const char *prompt = NULL;
     const char *output = "outputs/h3.mp4";
     h3_params params = H3_PARAMS_DEFAULT;
+    h3_lora_model lora_target = H3_LORA_FL2VA;
     h3_reference references[12];
     size_t reference_count = 0;
     cli_state cli = {{0}, 0, -1, -1, H3_TERM_NONE, 0, NULL, 0};
@@ -331,6 +353,24 @@ int main(int argc, char **argv) {
     int option;
     while ((option = getopt_long(argc, argv, "d:p:o:h", options, NULL)) != -1) {
         switch (option) {
+            case OPT_VIDEO_SHIFT: params.video_shift = parse_shift(optarg); break;
+            case OPT_AUDIO_SHIFT: params.audio_shift = parse_shift(optarg); break;
+            case OPT_SAMPLER:
+                if (!strcmp(optarg, "euler")) params.sampler = H3_SAMPLER_EULER;
+                else if (!strcmp(optarg, "lcm")) params.sampler = H3_SAMPLER_LCM;
+                else if (!strcmp(optarg, "res_multistep")) params.sampler = H3_SAMPLER_RES_MULTISTEP;
+                else { fprintf(stderr, "h3: unknown sampler: %s\n", optarg); return 2; }
+                break;
+            case OPT_SCHEDULER:
+                if (!strcmp(optarg, "serving")) params.scheduler = H3_SCHEDULER_SERVING;
+                else if (!strcmp(optarg, "simple")) params.scheduler = H3_SCHEDULER_SIMPLE;
+                else { fprintf(stderr, "h3: unknown scheduler: %s\n", optarg); return 2; }
+                break;
+            case OPT_LORA_MODEL:
+                if (!strcmp(optarg, "fl2va")) lora_target = H3_LORA_FL2VA;
+                else if (!strcmp(optarg, "ref2va")) lora_target = H3_LORA_REF2VA;
+                else { fprintf(stderr, "h3: unknown LoRA target: %s\n", optarg); return 2; }
+                break;
             case OPT_LORA: {
                 if (optind >= argc) {
                     fprintf(stderr, "h3: --lora requires PATH STRENGTH\n");
@@ -520,8 +560,16 @@ int main(int argc, char **argv) {
     int active_loras = 0;
     for (size_t i = 0; i < lora_count; i++)
         active_loras |= cli_loras[i].strength != 0.0f;
-    if (active_loras && (params.ssd_streaming || reference_count)) {
-        fprintf(stderr, "h3: active LoRAs require FL2VA without SSD streaming or ordered references\n");
+    if ((params.scheduler == H3_SCHEDULER_SERVING && params.sampler != H3_SAMPLER_EULER) ||
+        (params.scheduler == H3_SCHEDULER_SIMPLE &&
+         (params.denoise_reuse != 1 || params.core_reuse != 1 || params.token_reduction ||
+          params.dit_layers != H3_DEFAULT_DIT_LAYERS || params.render_width || params.render_height))) {
+        fprintf(stderr, "h3: serving requires Euler; simple requires full canvas, 50 blocks, no token reduction, reuse/core-reuse 1\n");
+        return 2;
+    }
+    if (active_loras && (params.ssd_streaming ||
+        (prompt && ((reference_count != 0) != (lora_target == H3_LORA_REF2VA))))) {
+        fprintf(stderr, "h3: active LoRA target must match request mode and cannot use SSD streaming\n");
         return 2;
     }
     if (prompt && params.steps >= 2 && params.steps <= 7 &&
@@ -539,7 +587,7 @@ int main(int argc, char **argv) {
         return 1;
     }
     if (profile) setenv("H3_PROFILE", "1", 1);
-    h3_ctx *ctx = h3_load_dir(model_dir, cli_loras, lora_count);
+    h3_ctx *ctx = h3_load_dir(model_dir, cli_loras, lora_count, lora_target);
     free_cli_loras();
     if (!ctx) {
         fprintf(stderr, "h3: %s\n", h3_last_error(NULL));

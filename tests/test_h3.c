@@ -74,7 +74,7 @@ static void test_schedule(void) {
     CHECK(defaults.use_reference_rope == 0);
 
     h3_sigma_schedule schedule;
-    CHECK(h3_schedule_build(20, &schedule));
+    CHECK(h3_schedule_build(20, 12.0f, 3.0f, &schedule));
     CHECK(schedule.steps == 20);
     CHECK(schedule.video[0] == 1.0f && schedule.audio[0] == 1.0f);
     CHECK(schedule.video[20] == 0.0f && schedule.audio[20] == 0.0f);
@@ -91,7 +91,7 @@ static void test_schedule(void) {
     CHECK(close_enough(back, 0.5, 1e-12));
     CHECK(h3_time_shift_slope(0.5, 12.0, 3.0) > 0.0);
 
-    CHECK(h3_serving_schedule_build(50, &schedule));
+    CHECK(h3_serving_schedule_build(50, 12.0f, 3.0f, &schedule));
     CHECK(schedule.steps == 50);
     CHECK(schedule.video[0] == 1.0f && schedule.audio[0] == 1.0f);
     CHECK(schedule.video[50] == 0.0f && schedule.audio[50] == 0.0f);
@@ -105,7 +105,7 @@ static void test_schedule(void) {
         CHECK(schedule.audio[index] > schedule.audio[index + 1]);
     }
 
-    CHECK(h3_serving_schedule_build(4, &schedule));
+    CHECK(h3_serving_schedule_build(4, 12.0f, 3.0f, &schedule));
     CHECK(schedule.steps == 4);
     CHECK(schedule.video[0] == 1.0f && schedule.audio[0] == 1.0f);
     CHECK(close_enough(schedule.video[1], 36.0 / 37.0, 1e-7));
@@ -115,8 +115,8 @@ static void test_schedule(void) {
         CHECK(schedule.video[index] > schedule.video[index + 1]);
         CHECK(schedule.audio[index] > schedule.audio[index + 1]);
     }
-    CHECK(!h3_serving_schedule_build(1, &schedule));
-    CHECK(!h3_serving_schedule_build(H3_MAX_STEPS + 1, &schedule));
+    CHECK(!h3_serving_schedule_build(1, 12.0f, 3.0f, &schedule));
+    CHECK(!h3_serving_schedule_build(H3_MAX_STEPS + 1, 12.0f, 3.0f, &schedule));
 }
 
 static void test_dit_reuse_schedule(void) {

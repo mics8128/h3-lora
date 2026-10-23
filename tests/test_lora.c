@@ -155,6 +155,39 @@ static void numeric(void) {
         require(output[0] == 6 && output[1] == 9 && output[2] == 12,
                 "unaligned snapshot F32 panels use aligned scratch");
     }
+    {
+        uint16_t half[] = {0x3c00, 0xc000, 0x0001, 0x03ff, 0x8000, 0};
+        float up[] = {1}, output[6] = {0};
+        h3_lora_factor factor = {half, up, H3_DTYPE_F16, H3_DTYPE_F32, 1, 1};
+        h3_lora_target target = {.name = "half", .rows = 1, .columns = 6,
+                                 .dtype = H3_DTYPE_F32, .factors = &factor,
+                                 .factor_count = 1};
+        compose(&target, 0, 1, output);
+        require(output[0] == 1 && output[1] == -2 && output[2] == 0x1p-24f &&
+                    output[3] == 1023 * 0x1p-24f && output[4] == 0 && output[5] == 0,
+                "IEEE half normal, subnormal and signed zero mixed factors");
+        uint16_t bfup[] = {0x4000};
+        factor.b = bfup;
+        factor.b_dtype = H3_DTYPE_BF16;
+        memset(output, 0, sizeof(output));
+        compose(&target, 0, 1, output);
+        require(output[0] == 2 && output[2] == 0x1p-23f, "mixed F16/BF16 factors");
+        char error[128];
+        size_t bytes = h3_lora_scratch_bytes(&target, 1);
+        void *scratch = malloc(bytes);
+        require(scratch != NULL, "half scratch");
+        target.dtype = H3_DTYPE_F16;
+        require(!h3_lora_merge_rows(&target, 0, 1, output, scratch, bytes,
+                                    error, sizeof(error)), "F16 destination rejected");
+        target.dtype = H3_DTYPE_F32;
+        half[0] = 0x7c00;
+        require(!h3_lora_merge_rows(&target, 0, 1, output, scratch, bytes,
+                                    error, sizeof(error)), "half infinity rejected");
+        half[0] = 0x7e00;
+        require(!h3_lora_merge_rows(&target, 0, 1, output, scratch, bytes,
+                                    error, sizeof(error)), "half NaN rejected");
+        free(scratch);
+    }
     char e[128];
     size_t bytes = h3_lora_scratch_bytes(&t, 1);
     void *s = malloc(bytes);
@@ -203,6 +236,22 @@ static void adapter(const char *path, const char *stem, int alpha, float av, flo
             stem, an + bn, an + bn + 4);
     }
     file(path, json, data, an + bn + (alpha ? 4 : 0));
+    free(data);
+}
+static void metadata_adapter(const char *path, const char *metadata, int alpha,
+                             uint16_t alpha_bits) {
+    size_t count = 5376 + 32;
+    unsigned char *data = calloc(count * 4 + 2, 1);
+    require(data != NULL, "metadata fixture");
+    float one = 1;
+    for (size_t i = 0; i < count; i++) memcpy(data + 4 * i, &one, 4);
+    memcpy(data + count * 4, &alpha_bits, 2);
+    char json[4096], suffix[256] = "";
+    if (alpha)
+        snprintf(suffix, sizeof(suffix), ",\"final_layer.audio_out.alpha\":{\"dtype\":\"F16\",\"shape\":[],\"data_offsets\":[21632,21634]}");
+    snprintf(json, sizeof(json),
+             "{\"__metadata__\":{%s},\"final_layer.audio_out.lora_A.weight\":{\"dtype\":\"F32\",\"shape\":[1,5376],\"data_offsets\":[0,21504]},\"final_layer.audio_out.lora_B.weight\":{\"dtype\":\"F32\",\"shape\":[32,1],\"data_offsets\":[21504,21632]}%s}", metadata, suffix);
+    file(path, json, data, count * 4 + (alpha ? 2 : 0));
     free(data);
 }
 static void parser_validation(void) {
@@ -312,6 +361,48 @@ static void stack_and_metal(void) {
     h3_weight_store *store = h3_weight_store_open(dir, e, sizeof(e));
     require(store != NULL, e);
     h3_lora_spec zero = {"/not/present", -0.0f};
+    {
+        const char *ordinary = "\"ss_network_module\":\"networks.lora\",\"ss_network_alpha\":\"0.25\",\"ss_network_dim\":\"99\"";
+        h3_lora_spec fixture = {ap, 1};
+        for (int explicit = 0; explicit < 2; explicit++) {
+            metadata_adapter(ap, ordinary, explicit, 0x3800);
+            h3_lora_stack *ms = h3_lora_stack_load(&fixture, 1, store, e, sizeof(e));
+            require(ms != NULL, e);
+            float result[5376] = {0};
+            compose((h3_lora_target *)h3_lora_find_target(ms, "final_layer.audio_out.weight"), 0, 1, result);
+            require(result[17] == (explicit ? 0.5f : 0.25f), "metadata alpha applied; F16 explicit alpha wins; dim ignored");
+            h3_lora_stack_free(ms);
+        }
+        const char *bad[] = {
+            "\"ss_network_module\":\"networks.lora\",\"ss_network_alpha\":\"oops\"",
+            "\"ss_network_module\":\"networks.lora\",\"ss_network_alpha\":\"nan\"",
+            "\"ss_network_alpha\":\"0.25\"",
+            "\"ss_network_alpha\":\"Dynamic\"",
+            "\"ss_network_args\":\"{}\"",
+            "\"rslora\":\"true\"",
+            "\"dora\":\"true\""};
+        for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+            metadata_adapter(ap, bad[i], 0, 0);
+            require(!h3_lora_stack_load(&fixture, 1, store, e, sizeof(e)), "unsupported metadata fails closed");
+        }
+        metadata_adapter(ap, ordinary, 1, 0x7c00);
+        require(!h3_lora_stack_load(&fixture, 1, store, e, sizeof(e)), "nonfinite F16 alpha rejected");
+        const char *normalized = "\"ss_network_alpha\":\"Dynamic\",\"alpha_normalized\":\"true\",\"alpha_normalization\":\"lora_up := lora_up * (alpha / rank); alpha tensors removed\"";
+        const char *baked = "\"ss_network_alpha\":\"Dynamic\",\"converted_layout\":\"comfyui_minimax_h3\",\"baked_scale\":\"0.125\",\"conversion\":\"qkv block-diag fused (per-projection ranks); mlp.fc1 swiglu halves swapped; alpha dropped (alpha==rank, scale 1.0); effective scale 0.125 baked into lora_B (flat multiplier, NOT alpha/rank)\"";
+        const char *accepted[] = {normalized, baked, "\"ss_network_alpha\":\"Dynamic\""};
+        for (int i = 0; i < 3; i++) {
+            metadata_adapter(ap, accepted[i], i == 2, 0x3800);
+            h3_lora_stack *ms = h3_lora_stack_load(&fixture, 1, store, e, sizeof(e));
+            require(ms != NULL, e);
+            float result[5376] = {0};
+            compose((h3_lora_target *)h3_lora_find_target(ms, "final_layer.audio_out.weight"), 0, 1, result);
+            require(result[0] == (i == 2 ? 0.5f : 1), "baked scaling not reapplied; Dynamic uses explicit alpha");
+            h3_lora_stack_free(ms);
+        }
+        metadata_adapter(ap, "\"baked_scale\":\"0.125\",\"conversion\":\"unknown\"", 0, 0);
+        require(!h3_lora_stack_load(&fixture, 1, store, e, sizeof(e)), "unknown baked semantics rejected");
+        adapter(ap, "diffusion_model.final_layer.audio_out", 1, 0.5f, 2, 3);
+    }
     require(!h3_lora_stack_load(&zero, 1, store, e, sizeof(e)) && !e[0],
             "zero strength never opens path");
     h3_lora_spec specs[] = {{ap, 1}, {cp, -0.25f}, {ap, 0.5f}};
@@ -428,11 +519,12 @@ static void stack_and_metal(void) {
             "wrong dimensions rejected");
     file(ap,
          "{\"final_layer.audio_out.lora_A.weight\":{\"dtype\":\"F16\",\"shape\":[1,"
-         "5376],\"data_offsets\":[0,10752]},\"final_layer.audio_out.lora_B.weight\":{"
+         "5376],\"data_offsets\":[0,10752]},\"final_layer.audio_out.lora_B.weight\":{" 
          "\"dtype\":\"F32\",\"shape\":[32,1],\"data_offsets\":[10752,10880]}}",
          base, 10880);
-    require(!h3_lora_stack_load(&invalid, 1, store, e, sizeof(e)) && strstr(e, "dtype"),
-            "unsupported F16 rejected");
+    h3_lora_stack *half_stack = h3_lora_stack_load(&invalid, 1, store, e, sizeof(e));
+    require(half_stack != NULL, e);
+    h3_lora_stack_free(half_stack);
     file(ap, "{\"__metadata__\":{\"application\":\"W_eff = W + B @ A / sqrt(rank)\"}}",
          NULL, 0);
     require(!h3_lora_stack_load(&invalid, 1, store, e, sizeof(e)) &&

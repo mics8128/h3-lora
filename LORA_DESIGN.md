@@ -3,15 +3,17 @@
 ## Provenance and scope
 
 This implementation follows the specification commissioned from the exact
-`llm-esapp/gpt-6-astra` model: immutable, additive, load-time FL2VA composition.
-It does not modify sampling, Euler timesteps, DMAD, text encoders or VAEs, and
-introduces no merged-checkpoint export, persistent weight cache or hot swap.
+`llm-esapp/gpt-6-astra` model: immutable, additive, load-time composition.
+The subsequent Turbo design adds explicit FL2VA/Ref2VA targeting and sampling;
+see [TURBO_DESIGN.md](TURBO_DESIGN.md). Text encoders and VAEs are not adapted;
+there is no merged-checkpoint export, persistent weight cache or hot swap.
 The existing MIT notice is retained; adapter licenses remain independent.
 
 ## Public and lifecycle contract
 
-`h3_load_dir(model_dir, specs, count)` accepts `h3_lora_spec { path, strength }`.
-No-adapter callers pass `NULL, 0`. Finite signed strengths are required. Either
+`h3_load_dir(model_dir, specs, count, target)` accepts `h3_lora_spec { path, strength }`
+and `H3_LORA_FL2VA` or `H3_LORA_REF2VA`. No-adapter callers pass `NULL, 0, H3_LORA_FL2VA`.
+Finite signed strengths are required. Either
 signed zero disables the entry without opening, hashing or retaining its path.
 The context owns copied active specifications and immutable original-dtype
 adapter snapshots; `h3_get_loras(ctx, &count)` returns borrowed canonical specs.
@@ -19,8 +21,9 @@ Repeated entries add rather than replace. Composition order is canonical by
 content SHA-256 and strength, not CLI order. Identity includes interpretation
 version and is appended only to active-stack prepared-DiT cache keys.
 
-Construction validates adapters against an FL2VA metadata store before Metal
-work. Base tensor payloads remain unloaded until generation. Weight stores
+Construction validates adapters against the selected actual FL2VA or Ref2VA
+metadata store before Metal work. Missing selected bases fail; base tensor
+payloads remain unloaded until generation. Weight stores
 borrow the context-owned stack and bind only before their first payload load.
 DiT binding precedes token refinement and AdaLN precomputation. Cache clearing
 frees prepared models but retains snapshots. Seed-only reuse avoids remerging;
@@ -29,8 +32,10 @@ frees prepared models before the stack. Replacing source files cannot mutate
 an existing context; base files must remain unchanged as in the original loader.
 
 Active-stack SSD streaming is rejected, never silently disabled: its direct
-slot reader otherwise bypasses adapted weight loading. Ordered Ref2VA requests
-are also rejected before encoding; first/last-frame FL2VA is not Ref2VA.
+slot reader otherwise bypasses adapted weight loading. Active adapter targets
+must match request mode. Ref2VA requires a real ordered reference image and
+match sizing; first/last-frame FL2VA is not Ref2VA. No-adapter automatic routing
+is unchanged.
 The CLI, interactive SSD setter, C generation API and internal loader enforce
 these boundaries. `!status` reports the fixed stack; changes require a new
 context. `--info` snapshots active adapter payloads, unlike metadata-only base
@@ -38,19 +43,30 @@ inspection without adapters.
 
 ## Composition and supported format
 
-Ordinary rank-2 F32/BF16 A/down `[rank,in]`, B/up `[out,rank]` pairs are supported
+Ordinary rank-2 F32/BF16/F16 A/down `[rank,in]`, B/up `[out,rank]` pairs are supported
 through exact recognized native/Comfy prefixes and explicit Kohya aliases.
 There is no generic underscore replacement or arbitrary prefix stripping.
 For each target:
 
 `W' = store(F32(W) + sum(strength * alpha/rank * row_map(B @ A)))`.
 
-Explicit alpha wins; absent alpha defaults to rank only under the defined
-ordinary additive dialect. Unknown scaling, layout or tensor kinds fail closed.
-All active tensors must be accounted for, including tensors in omitted layers.
-DoRA, dense deltas, bias/norm updates, convolutional factors, F16 and quantized
-adapter factors are outside this contract. Missing pairs, aliases, incompatible
-shapes, malformed offsets/overlap and nonfinite values are errors.
+Explicit scalar F32/BF16/F16 tensor alpha wins. For ordinary `networks.lora`
+metadata, finite nonnegative scalar `ss_network_alpha` is the fallback; otherwise
+absent alpha defaults to rank. Tensor/metadata conflicts are reported, with
+tensor precedence; optional `ss_network_dim` does not change scaling. IEEE half
+factors widen exactly, including subnormals and signed zero. Destinations remain
+F32/BF16 only. Unknown scaling, layout, `ss_network_args` or tensor kinds fail
+closed. All active tensors must be accounted for, including omitted layers.
+DoRA, rsLoRA, dense deltas, bias/norm updates, convolutional and quantized adapter
+factors are outside this contract. Missing pairs, aliases, incompatible shapes,
+malformed offsets/overlap and nonfinite values are errors.
+`Dynamic` metadata alpha requires per-target tensor alpha or an explicit supported
+baked declaration. Known Comfy H3 conversions declaring alpha folded/dropped into
+B (flat baked scales 0.125 or 1.0), and the exact normalization declaration
+`lora_up := lora_up * (alpha / rank); alpha tensors removed`, retain their stored
+factor values: baked scaling is never multiplied again. The recognized layout is
+`comfyui_minimax_h3`; unknown baked scaling declarations and simultaneous scalar
+metadata alpha plus baked scaling fail closed.
 
 CPU Accelerate SGEMM uses bounded 128-output-row and 64-rank panels. Factors
 remain original dtype; scratch is bounded rather than a full F32 matrix or full
@@ -123,7 +139,7 @@ reuse/core-reuse one, seed 42, no token reduction, references or SSD streaming.
 Fully decode and inspect all clips; report generation success, numerical
 correctness, visible effect and quality claims separately. Cache smoke must
 cover seed reuse, prompt rebuild, cache clear, changed source snapshots and
-rejected SSD/Ref2VA requests; no-LoRA/all-zero and existing SSD behavior remain
+rejected SSD/target-mismatched requests; no-LoRA/all-zero and existing SSD behavior remain
 separate regression gates. Layer thinning is an explicit approximation, never
 a reason to leave adapter tensors unvalidated.
 
@@ -147,7 +163,7 @@ F32 panel, Metal projection and M5 quantization tests passed remotely. Existing
 `make test` ran 1,768 host checks, AudioVAE Metal primitives and the media mux
 smoke; optional external fixture-dependent tests reported skips.
 
-Runtime lifecycle smoke passed: seed-only prepared-DiT reuse, prompt-triggered
+The initial FL2VA-target lifecycle smoke passed: seed-only prepared-DiT reuse, prompt-triggered
 rebuild, cache-clear retaining the stack, a new context with a new strength,
 and SSD/ordered-reference rejection before encoding. Source-file removal after
 snapshot is covered by the synthetic fixture. The reviewed code also avoids

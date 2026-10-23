@@ -2,6 +2,7 @@
 
 #include "h3_dit_schedule.h"
 #include "h3_weights.h"
+#include "h3_sampler.h"
 
 #include <math.h>
 #include <pthread.h>
@@ -71,6 +72,9 @@ struct h3_dit {
     h3_gpu *gpu;
     h3_weight_store *weights;
     h3_dit_schedule *schedule;
+    float *forward_video_rows, *forward_audio_rows;
+    uint16_t *forward_video_out, *forward_audio_out;
+    float *forward_video_f32, *forward_audio_f32;
     int fused_mlp;
     int nax_mlp;
     int int8_mlp;
@@ -1596,7 +1600,7 @@ static h3_dit *load_dit(const char *weight_directory,
     }
     if (loras && ssd_streaming) {
         fail(error, error_size,
-             "active LoRA stack requires FL2VA without SSD streaming");
+             "active LoRA stack does not support SSD streaming");
         return NULL;
     }
     h3_dit *dit = calloc(1, sizeof(*dit));
@@ -2478,19 +2482,32 @@ int h3_dit_forward(h3_dit *dit, int step,
     }
     size_t video_row_elements = (size_t)dit->video_rows * VIDEO_PATCH;
     size_t audio_row_elements = (size_t)dit->audio_rows * AUDIO_CHANNELS;
-    float *video_rows = malloc(video_row_elements * sizeof(*video_rows));
-    float *audio_rows = malloc(audio_row_elements * sizeof(*audio_rows));
-    uint16_t *video_out = malloc(video_row_elements * sizeof(*video_out));
-    uint16_t *audio_out = malloc(audio_row_elements * sizeof(*audio_out));
-    float *video_f32 = malloc(video_row_elements * sizeof(*video_f32));
-    float *audio_f32 = malloc(audio_row_elements * sizeof(*audio_f32));
-    if (!video_rows || !audio_rows || !video_out || !audio_out ||
-        !video_f32 || !audio_f32) {
-        fail(error, error_size, "out of memory packing DiT latents");
-        free(video_rows); free(audio_rows); free(video_out); free(audio_out);
-        free(video_f32); free(audio_f32);
-        return 0;
+    if (!dit->forward_video_rows) {
+        dit->forward_video_rows = malloc(video_row_elements * sizeof(float));
+        dit->forward_audio_rows = malloc(audio_row_elements * sizeof(float));
+        dit->forward_video_out = malloc(video_row_elements * sizeof(uint16_t));
+        dit->forward_audio_out = malloc(audio_row_elements * sizeof(uint16_t));
+        dit->forward_video_f32 = malloc(video_row_elements * sizeof(float));
+        dit->forward_audio_f32 = malloc(audio_row_elements * sizeof(float));
+        if (!dit->forward_video_rows || !dit->forward_audio_rows ||
+            !dit->forward_video_out || !dit->forward_audio_out ||
+            !dit->forward_video_f32 || !dit->forward_audio_f32) {
+            free(dit->forward_video_rows); free(dit->forward_audio_rows);
+            free(dit->forward_video_out); free(dit->forward_audio_out);
+            free(dit->forward_video_f32); free(dit->forward_audio_f32);
+            dit->forward_video_rows = dit->forward_audio_rows = NULL;
+            dit->forward_video_out = dit->forward_audio_out = NULL;
+            dit->forward_video_f32 = dit->forward_audio_f32 = NULL;
+            fail(error, error_size, "out of memory packing DiT latents");
+            return 0;
+        }
     }
+    float *video_rows = dit->forward_video_rows;
+    float *audio_rows = dit->forward_audio_rows;
+    uint16_t *video_out = dit->forward_video_out;
+    uint16_t *audio_out = dit->forward_audio_out;
+    float *video_f32 = dit->forward_video_f32;
+    float *audio_f32 = dit->forward_audio_f32;
     int ok = h3_dit_patchify_video(video_latent, VIDEO_CHANNELS,
         dit->latent_t, dit->latent_h, dit->latent_w, video_rows,
         video_row_elements) &&
@@ -2527,8 +2544,6 @@ int h3_dit_forward(h3_dit *dit, int step,
         h3_dit_unpack_audio(audio_f32, AUDIO_CHANNELS, dit->audio_t,
                             audio_velocity, h3_dit_audio_elements(dit));
     if (!ok && (!error || !*error)) fail(error, error_size, "cannot unpack DiT output");
-    free(video_rows); free(audio_rows); free(video_out); free(audio_out);
-    free(video_f32); free(audio_f32);
     return ok;
 }
 
@@ -2811,77 +2826,72 @@ static int denoise_euler_gpu(h3_dit *dit, float *video_latent,
     return ok;
 }
 
-int h3_dit_denoise(h3_dit *dit, float *video_latent, float *audio_latent,
-                   h3_dit_progress progress, void *progress_opaque,
-                   char *error, size_t error_size) {
+typedef struct {
+    h3_dit *dit;
+    h3_dit_progress progress;
+    void *progress_opaque;
+    h3_dit_preview preview;
+    void *preview_opaque;
+    int evaluations;
+} h3_simple_adapter;
+
+static int simple_evaluate(int step, const float *video, const float *audio,
+    float *video_velocity, float *audio_velocity, void *opaque,
+    char *error, size_t error_size) {
+    h3_simple_adapter *adapter = opaque;
+    report(adapter->progress, adapter->progress_opaque, "denoise", step,
+           adapter->dit->sigmas.steps);
+    adapter->evaluations++;
+    return h3_dit_forward(adapter->dit, step, video, audio, video_velocity,
+                          audio_velocity, error, error_size);
+}
+
+static int simple_observe(int completed, const float *video,
+    const float *audio, void *opaque, char *error, size_t error_size) {
+    (void)audio;
+    h3_simple_adapter *adapter = opaque;
+    if (adapter->preview && adapter->preview(completed,
+            adapter->dit->sigmas.steps, video,
+            h3_dit_video_elements(adapter->dit), adapter->preview_opaque)) {
+        fail(error, error_size, "denoising cancelled by preview callback");
+        return 0;
+    }
+    report(adapter->progress, adapter->progress_opaque, "denoise", completed,
+           adapter->dit->sigmas.steps);
+    return 1;
+}
+
+int h3_dit_denoise_simple_preview(h3_dit *dit, h3_sampler_kind kind,
+    uint64_t seed, float video_shift, float audio_shift,
+    float *video_latent, float *audio_latent,
+    h3_dit_progress progress, void *progress_opaque,
+    h3_dit_preview preview, void *preview_opaque,
+    char *error, size_t error_size) {
     if (error && error_size) error[0] = '\0';
-    if (!dit || !video_latent || !audio_latent ||
-        dit->sigmas.steps != h3_dit_schedule_steps(dit->schedule)) {
-        fail(error, error_size, "invalid DiT denoising arguments");
+    if (!dit || dit->sigmas.steps != h3_dit_schedule_steps(dit->schedule) ||
+        dit->core_reuse_interval != 1 || dit->token_reduction) {
+        fail(error, error_size, "simple sampling requires core reuse 1 and no token reduction");
         return 0;
     }
-    size_t video_count = h3_dit_video_elements(dit);
-    size_t audio_count = h3_dit_audio_elements(dit);
-    float *video_velocity = malloc(video_count * sizeof(*video_velocity));
-    float *audio_velocity = malloc(audio_count * sizeof(*audio_velocity));
-    float *video_denoised = malloc(video_count * sizeof(*video_denoised));
-    float *audio_denoised = malloc(audio_count * sizeof(*audio_denoised));
-    float *old_video = malloc(video_count * sizeof(*old_video));
-    float *old_audio = malloc(audio_count * sizeof(*old_audio));
-    float *video_next = malloc(video_count * sizeof(*video_next));
-    float *audio_next = malloc(audio_count * sizeof(*audio_next));
-    if (!video_velocity || !audio_velocity || !video_denoised ||
-        !audio_denoised || !old_video || !old_audio || !video_next ||
-        !audio_next) {
-        fail(error, error_size, "out of memory allocating RES solver state");
-        free(video_velocity); free(audio_velocity); free(video_denoised);
-        free(audio_denoised); free(old_video); free(old_audio);
-        free(video_next); free(audio_next);
-        return 0;
+    h3_simple_adapter adapter = {dit, progress, progress_opaque, preview, preview_opaque, 0};
+    int ok = h3_sampler_run(kind, &dit->sigmas, video_shift, audio_shift,
+        seed, video_latent, h3_dit_video_elements(dit),
+        audio_latent, h3_dit_audio_elements(dit), simple_evaluate, &adapter,
+        NULL, NULL, simple_observe, &adapter, error, error_size);
+    if (getenv("H3_PROFILE")) {
+        const char *name = kind == H3_SAMPLER_EULER ? "euler" :
+                           kind == H3_SAMPLER_LCM ? "lcm" : "res_multistep";
+        fprintf(stderr, "h3 sampler: {\"kind\":\"%s\",\"scheduler\":\"simple\","
+                        "\"nfe\":%d,\"success\":%d,\"video_sigmas\":[",
+                name, adapter.evaluations, ok);
+        for (int i = 0; i <= dit->sigmas.steps; i++)
+            fprintf(stderr, "%s%.9g", i ? "," : "", dit->sigmas.video[i]);
+        fprintf(stderr, "],\"audio_sigmas\":[");
+        for (int i = 0; i <= dit->sigmas.steps; i++)
+            fprintf(stderr, "%s%.9g", i ? "," : "", dit->sigmas.audio[i]);
+        fprintf(stderr, "]}\n");
     }
-    int ok = 1;
-    for (int step = 0; step < dit->sigmas.steps && ok; step++) {
-        report(progress, progress_opaque, "denoise", step, dit->sigmas.steps);
-        ok = h3_dit_forward(dit, step, video_latent, audio_latent,
-                            video_velocity, audio_velocity,
-                            error, error_size);
-        float sigma = dit->sigmas.video[step];
-        float timestep = 1.0f - sigma;
-        float sigma_from_timestep = 1.0f - timestep;
-        float audio_slope = (float)h3_time_shift_slope(
-            sigma, H3_VIDEO_SIGMA_SHIFT, H3_AUDIO_SIGMA_SHIFT);
-        if (ok) {
-            for (size_t index = 0; index < video_count; index++)
-                video_denoised[index] = video_latent[index] +
-                    sigma_from_timestep * video_velocity[index];
-            for (size_t index = 0; index < audio_count; index++)
-                audio_denoised[index] = audio_latent[index] +
-                    sigma_from_timestep * audio_velocity[index] * audio_slope;
-            ok = h3_res_step(video_next, video_latent, video_denoised,
-                             step ? old_video : NULL, video_count,
-                             dit->sigmas.video, step, dit->sigmas.steps) &&
-                 h3_res_step(audio_next, audio_latent, audio_denoised,
-                             step ? old_audio : NULL, audio_count,
-                             dit->sigmas.video, step, dit->sigmas.steps);
-            if (!ok) fail(error, error_size, "RES solver rejected step %d", step);
-        }
-        if (ok) {
-            memcpy(video_latent, video_next,
-                   video_count * sizeof(*video_latent));
-            memcpy(audio_latent, audio_next,
-                   audio_count * sizeof(*audio_latent));
-            memcpy(old_video, video_denoised,
-                   video_count * sizeof(*old_video));
-            memcpy(old_audio, audio_denoised,
-                   audio_count * sizeof(*old_audio));
-            report(progress, progress_opaque, "denoise", step + 1,
-                   dit->sigmas.steps);
-        }
-    }
-    free(video_velocity); free(audio_velocity); free(video_denoised);
-    free(audio_denoised); free(old_video); free(old_audio);
-    free(video_next); free(audio_next);
-    h3_gpu_profile_mark(dit->gpu, "RES denoise");
+    h3_gpu_profile_mark(dit->gpu, "simple denoise");
     return ok;
 }
 
@@ -3085,6 +3095,9 @@ void h3_dit_free(h3_dit *dit) {
     h3_gpu_free(dit->gpu);
     h3_weight_store_free(dit->weights);
     h3_layout_free(&dit->layout);
+    free(dit->forward_video_rows); free(dit->forward_audio_rows);
+    free(dit->forward_video_out); free(dit->forward_audio_out);
+    free(dit->forward_video_f32); free(dit->forward_audio_f32);
     free(dit);
 }
 

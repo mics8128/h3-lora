@@ -151,6 +151,7 @@ static int cli_frame(const h3_frame *frame, void *opaque) {
 static void print_help(void) {
     puts("Commands:");
     puts("  LoRAs are fixed: changing paths/strengths requires a new process/context.");
+    puts("  Sampler/scheduler/shifts are selected with startup flags; !status reports them.");
     puts("  !help                    Show this help");
     puts("  !status                  Show current settings");
     puts("  !seed [N|random]         Set or show the seed");
@@ -186,6 +187,14 @@ static void print_help(void) {
 static void print_status(const h3_cli_state *state) {
     if (state->ctx->loras) h3_lora_stack_report(state->ctx->loras, stdout);
     else puts("LoRA stack: none (fixed for this context)");
+    printf("Sampler: %s | scheduler: %s | video/audio shifts: %.9g/%.9g\n",
+           state->params.sampler == H3_SAMPLER_EULER ? "euler" :
+           state->params.sampler == H3_SAMPLER_LCM ? "lcm" : "res_multistep",
+           state->params.scheduler == H3_SCHEDULER_SIMPLE ? "simple" : "serving",
+           (double)state->params.video_shift, (double)state->params.audio_shift);
+    if (state->ctx->loras)
+        printf("Immutable LoRA target: %s\n",
+               state->ctx->lora_target == H3_LORA_REF2VA ? "ref2va" : "fl2va");
     int aligned = h3_align_frame_count(state->params.frames);
     printf("Size: %dx%d", state->params.width, state->params.height);
     if (state->params.render_width)

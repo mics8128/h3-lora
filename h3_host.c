@@ -132,32 +132,38 @@ static float h3_shifted_sigma(int index, int steps, float shift) {
     return shift * base / (1.0f + (shift - 1.0f) * base);
 }
 
-int h3_schedule_build(int steps, h3_sigma_schedule *schedule) {
-    if (!schedule || steps < 1 || steps > H3_MAX_STEPS) return 0;
+int h3_schedule_build(int steps, float video_shift, float audio_shift,
+                      h3_sigma_schedule *schedule) {
+    if (!schedule || steps < 1 || steps > H3_MAX_STEPS ||
+        !isfinite(video_shift) || !isfinite(audio_shift) ||
+        video_shift <= 0 || audio_shift <= 0) return 0;
     memset(schedule, 0, sizeof(*schedule));
     schedule->steps = steps;
     for (int index = 0; index < steps; index++) {
         schedule->video[index] = h3_shifted_sigma(
-            index, steps, (float)H3_VIDEO_SIGMA_SHIFT);
+            index, steps, video_shift);
         schedule->audio[index] = h3_shifted_sigma(
-            index, steps, (float)H3_AUDIO_SIGMA_SHIFT);
+            index, steps, audio_shift);
     }
     schedule->video[steps] = 0.0f;
     schedule->audio[steps] = 0.0f;
     return 1;
 }
 
-int h3_serving_schedule_build(int evaluations, h3_sigma_schedule *schedule) {
-    if (!schedule || evaluations < 2 || evaluations > H3_MAX_STEPS) return 0;
+int h3_serving_schedule_build(int evaluations, float video_shift,
+                              float audio_shift, h3_sigma_schedule *schedule) {
+    if (!schedule || evaluations < 2 || evaluations > H3_MAX_STEPS ||
+        !isfinite(video_shift) || !isfinite(audio_shift) ||
+        video_shift <= 0 || audio_shift <= 0) return 0;
     memset(schedule, 0, sizeof(*schedule));
     schedule->steps = evaluations;
     float denominator = (float)evaluations;
     for (int index = 0; index <= evaluations; index++) {
         float base = 1.0f - (float)index / denominator;
-        schedule->video[index] = (float)H3_VIDEO_SIGMA_SHIFT * base /
-            (1.0f + ((float)H3_VIDEO_SIGMA_SHIFT - 1.0f) * base);
-        schedule->audio[index] = (float)H3_AUDIO_SIGMA_SHIFT * base /
-            (1.0f + ((float)H3_AUDIO_SIGMA_SHIFT - 1.0f) * base);
+        schedule->video[index] = video_shift * base /
+            (1.0f + (video_shift - 1.0f) * base);
+        schedule->audio[index] = audio_shift * base /
+            (1.0f + (audio_shift - 1.0f) * base);
     }
     schedule->video[evaluations] = 0.0f;
     schedule->audio[evaluations] = 0.0f;
@@ -610,7 +616,11 @@ int h3_res_step(float *output, const float *sample, const float *denoised,
     double sigma = sigmas[step];
     double next = sigmas[step + 1];
     if (!(sigma > next && next >= 0.0)) return 0;
-    if (!old_denoised || next == 0.0) {
+    if (next == 0.0) {
+        memmove(output, denoised, count * sizeof(*output));
+        return 1;
+    }
+    if (!old_denoised) {
         double delta = next - sigma;
         for (size_t index = 0; index < count; index++) {
             double derivative = ((double)sample[index] - denoised[index]) / sigma;

@@ -190,6 +190,20 @@ static char *h3_prepared_key(const h3_ctx *ctx, const char *conditioning,
         free(key.text);
         return NULL;
     }
+    if ((params->sampler != H3_SAMPLER_EULER ||
+         params->scheduler != H3_SCHEDULER_SERVING ||
+         params->video_shift != 12.0f || params->audio_shift != 3.0f) &&
+        !h3_key_append(&key, "|sampler=%d|scheduler=%d|shifts=%a,%a",
+            params->sampler, params->scheduler,
+            (double)params->video_shift, (double)params->audio_shift)) {
+        free(key.text);
+        return NULL;
+    }
+    if (ctx->loras && ctx->lora_target != H3_LORA_FL2VA &&
+        !h3_key_append(&key, "|lora-target=%d", ctx->lora_target)) {
+        free(key.text);
+        return NULL;
+    }
     if (ctx->loras && !h3_key_append(&key, "|loras=%s",
             h3_lora_stack_identity(ctx->loras))) {
         free(key.text);
@@ -412,8 +426,12 @@ static int h3_inventory(h3_ctx *ctx, const char *relative,
 }
 
 h3_ctx *h3_load_dir(const char *model_dir, const h3_lora_spec *loras,
-                    size_t lora_count) {
+                    size_t lora_count, h3_lora_model target) {
     h3_global_error[0] = '\0';
+    if (target != H3_LORA_FL2VA && target != H3_LORA_REF2VA) {
+        h3_set_error(NULL, "invalid LoRA model target");
+        return NULL;
+    }
     if (lora_count && !loras) {
         h3_set_error(NULL, "LoRA specifications are required");
         return NULL;
@@ -471,8 +489,15 @@ h3_ctx *h3_load_dir(const char *model_dir, const h3_lora_spec *loras,
         active_loras |= loras[i].strength != 0.0f;
     }
     if (active_loras) {
-        char *base_path = h3_path(model_dir, "FL2VA/transformer");
-        char detail[512] = "out of memory resolving FL2VA transformer";
+        ctx->lora_target = target;
+        if (target == H3_LORA_REF2VA && !has_ref2va) {
+            h3_set_error(NULL, "active Ref2VA LoRAs require the Ref2VA checkpoint");
+            h3_free(ctx);
+            return NULL;
+        }
+        char *base_path = h3_path(model_dir, target == H3_LORA_REF2VA ?
+                                  "Ref2VA/transformer" : "FL2VA/transformer");
+        char detail[512] = "out of memory resolving target transformer";
         h3_weight_store *base = base_path ? h3_weight_store_open(
             base_path, detail, sizeof(detail)) : NULL;
         free(base_path);
@@ -559,8 +584,27 @@ static int h3_valid_params(h3_ctx *ctx, const h3_params *params) {
         h3_set_error(ctx, "frames must align within the released 5..362 range");
         return 0;
     }
-    if (params->steps < 2 || params->steps > H3_MAX_STEPS) {
-        h3_set_error(ctx, "denoising steps must be in [2, 1000]");
+    if (params->sampler < H3_SAMPLER_EULER ||
+        params->sampler > H3_SAMPLER_RES_MULTISTEP ||
+        params->scheduler < H3_SCHEDULER_SERVING ||
+        params->scheduler > H3_SCHEDULER_SIMPLE ||
+        !isfinite(params->video_shift) || params->video_shift <= 0.0f ||
+        !isfinite(params->audio_shift) || params->audio_shift <= 0.0f) {
+        h3_set_error(ctx, "invalid sampler, scheduler, or finite positive shifts");
+        return 0;
+    }
+    if ((params->scheduler == H3_SCHEDULER_SERVING &&
+         params->sampler != H3_SAMPLER_EULER) ||
+        (params->scheduler == H3_SCHEDULER_SIMPLE &&
+         (params->denoise_reuse != 1 || params->core_reuse != 1 ||
+          params->token_reduction || params->dit_layers != H3_DEFAULT_DIT_LAYERS ||
+          params->render_width || params->render_height))) {
+        h3_set_error(ctx, "serving requires Euler; simple requires full canvas, 50 blocks, no token reduction, reuse/core-reuse 1");
+        return 0;
+    }
+    if (params->steps < (params->scheduler == H3_SCHEDULER_SIMPLE ? 1 : 2) ||
+        params->steps > H3_MAX_STEPS) {
+        h3_set_error(ctx, "denoising steps must be in [2, 1000] for serving or [1, 1000] for simple");
         return 0;
     }
     if (params->denoise_reuse < 1 || params->denoise_reuse > 3) {
@@ -898,10 +942,21 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
         return NULL;
     }
     if (!h3_valid_params(ctx, params)) return NULL;
-    if (ctx->loras && (params->ssd_streaming || params->reference_count)) {
+    if (ctx->loras && (params->ssd_streaming ||
+        ((params->reference_count != 0) != (ctx->lora_target == H3_LORA_REF2VA)))) {
         h3_set_error(ctx,
-            "active LoRA stack requires FL2VA without SSD streaming or ordered references");
+            "active LoRA target must match request mode and cannot use SSD streaming");
         return NULL;
+    }
+    if (ctx->loras && ctx->lora_target == H3_LORA_REF2VA) {
+        int image = 0;
+        for (size_t i = 0; i < params->reference_count; i++)
+            image |= params->references[i].kind == H3_REFERENCE_IMAGE &&
+                     params->references[i].path && *params->references[i].path;
+        if (!image || params->reference_image_size != H3_REFERENCE_IMAGE_MATCH) {
+            h3_set_error(ctx, "Ref2VA LoRAs require an actual ordered reference image with match sizing");
+            return NULL;
+        }
     }
     int render_width = params->render_width ? params->render_width :
                                                params->width;
@@ -1505,7 +1560,9 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
         goto cleanup;
     }
     h3_sigma_schedule sigmas;
-    if (!h3_serving_schedule_build(params->steps, &sigmas)) {
+    if (!(params->scheduler == H3_SCHEDULER_SIMPLE ?
+          h3_schedule_build(params->steps, params->video_shift, params->audio_shift, &sigmas) :
+          h3_serving_schedule_build(params->steps, params->video_shift, params->audio_shift, &sigmas))) {
         h3_set_error(ctx, "cannot construct the requested sigma schedule");
         goto cleanup;
     }
@@ -1622,12 +1679,18 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     h3_rng_seed(&audio_rng, params->seed);
     h3_rng_fill_normal(&video_rng, video, video_count);
     h3_rng_fill_normal(&audio_rng, audio, audio_count);
-    if (!h3_dit_denoise_euler_preview(
+    int denoised = params->scheduler == H3_SCHEDULER_SIMPLE ?
+        h3_dit_denoise_simple_preview(
+            dit, params->sampler, params->seed, params->video_shift, params->audio_shift,
+            video, audio, h3_dit_progress_bridge, &progress,
+            preview_decoder ? h3_deliver_denoise_preview : NULL,
+            preview_decoder ? &live_preview : NULL, detail, sizeof(detail)) :
+        h3_dit_denoise_euler_preview(
             dit, video, audio, params->denoise_reuse,
             h3_dit_progress_bridge, &progress,
             preview_decoder ? h3_deliver_denoise_preview : NULL,
-            preview_decoder ? &live_preview : NULL,
-            detail, sizeof(detail))) {
+            preview_decoder ? &live_preview : NULL, detail, sizeof(detail));
+    if (!denoised) {
         if (!live_preview.failed) h3_set_error(ctx, "%s", detail);
         if (dit_is_cached) {
             ctx->dit = NULL;

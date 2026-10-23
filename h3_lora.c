@@ -23,6 +23,10 @@ typedef struct {
     h3_st_header header;
     size_t pairs, default_alpha;
     size_t min_rank, max_rank;
+    int has_metadata_alpha;
+    float metadata_alpha;
+    size_t alpha_conflicts;
+    int dynamic_alpha, baked_alpha;
 } backing;
 typedef struct {
     backing *data;
@@ -74,7 +78,27 @@ static float value(const void *data, h3_dtype dtype, size_t i) {
     else {
         uint16_t b;
         memcpy(&b, (const char *)data + 2 * i, 2);
-        uint32_t u = (uint32_t)b << 16;
+        uint32_t u;
+        if (dtype == H3_DTYPE_F16) {
+            uint32_t sign = (uint32_t)(b & 0x8000) << 16;
+            unsigned exponent = (b >> 10) & 31, fraction = b & 1023;
+            if (!exponent && fraction) {
+                int shift = 0;
+                while (!(fraction & 1024)) {
+                    fraction <<= 1;
+                    shift++;
+                }
+                u = sign | (uint32_t)(113 - shift) << 23 |
+                    (uint32_t)(fraction & 1023) << 13;
+            } else if (!exponent)
+                u = sign;
+            else if (exponent == 31)
+                u = sign | 0x7f800000u | (uint32_t)fraction << 13;
+            else
+                u = sign | (uint32_t)(exponent + 112) << 23 |
+                    (uint32_t)fraction << 13;
+        } else
+            u = (uint32_t)b << 16;
         memcpy(&f, &u, 4);
     }
     return f;
@@ -87,6 +111,9 @@ static uint16_t bf16(float f) {
 }
 static int matrix_dtype(h3_dtype d) {
     return d == H3_DTYPE_F32 || d == H3_DTYPE_BF16;
+}
+static int factor_dtype(h3_dtype d) {
+    return matrix_dtype(d) || d == H3_DTYPE_F16;
 }
 
 /* Enumerated semantic inventory also creates the collision-checked Kohya alias
@@ -250,7 +277,48 @@ static backing *snapshot(const char *path, char *e, size_t en) {
     }
     return b;
 }
-static int metadata_valid(const backing *b, char *e, size_t en) {
+static int metadata_valid(backing *b, char *e, size_t en) {
+    const char *module = NULL, *alpha = NULL, *conversion = NULL;
+    const char *baked = NULL, *normalized = NULL, *normalization = NULL;
+    for (size_t i = 0; i < b->header.metadata_count; i++) {
+        const char *k = b->header.metadata_keys[i], *v = b->header.metadata_values[i];
+        if (!strcmp(k, "ss_network_module")) module = v;
+        if (!strcmp(k, "ss_network_alpha")) alpha = v;
+        if (!strcmp(k, "conversion")) conversion = v;
+        if (!strcmp(k, "baked_scale")) baked = v;
+        if (!strcmp(k, "alpha_normalized")) normalized = v;
+        if (!strcmp(k, "alpha_normalization")) normalization = v;
+    }
+    if (baked) {
+        int known = conversion &&
+            ((!strcmp(baked, "0.125") &&
+              (!strcmp(conversion, "qkv fused contiguous q|k|v (block-diagonal, rank 3x); mlp.fc1 swiglu halves swapped; peft alpha/r=0.125 baked into lora_B") ||
+               !strcmp(conversion, "qkv block-diag fused (per-projection ranks); mlp.fc1 swiglu halves swapped; alpha dropped (alpha==rank, scale 1.0); effective scale 0.125 baked into lora_B (flat multiplier, NOT alpha/rank)"))) ||
+             (!strcmp(baked, "1.0") &&
+              !strcmp(conversion, "qkv block-diag fused (contiguous q|k|v); mlp.fc1 swiglu halves swapped; alpha folded into lora_B; scale 1.0 baked as a flat multiplier")));
+        if (!known)
+            return fail(e, en, "adapter %s: unsupported baked scaling declaration", b->header.path);
+        b->baked_alpha = 1;
+    }
+    if (normalized || normalization) {
+        if (!normalized || strcmp(normalized, "true") || !normalization ||
+            strcmp(normalization, "lora_up := lora_up * (alpha / rank); alpha tensors removed"))
+            return fail(e, en, "adapter %s: unsupported alpha normalization", b->header.path);
+        b->baked_alpha = 1;
+    }
+    b->dynamic_alpha = alpha && !strcmp(alpha, "Dynamic");
+    if (alpha && !b->dynamic_alpha) {
+        if (b->baked_alpha)
+            return fail(e, en, "adapter %s: scalar metadata alpha conflicts with baked scaling", b->header.path);
+        char *end;
+        float parsed = strtof(alpha, &end);
+        if (!module || strcmp(module, "networks.lora") || !*alpha ||
+            end == alpha || *end || !isfinite(parsed) || parsed < 0)
+            return fail(e, en, "adapter %s: unsupported/malformed ss_network_alpha=%s",
+                        b->header.path, alpha);
+        b->has_metadata_alpha = 1;
+        b->metadata_alpha = parsed;
+    }
     for (size_t i = 0; i < b->header.metadata_count; i++) {
         const char *k = b->header.metadata_keys[i], *v = b->header.metadata_values[i];
         if (!strcmp(k, "application") && strcmp(v, "W_eff = W + lora_B @ lora_A"))
@@ -259,9 +327,10 @@ static int metadata_valid(const backing *b, char *e, size_t en) {
         if (!strcmp(k, "ss_network_module") && strcmp(v, "networks.lora"))
             return fail(e, en, "adapter %s: unsupported network module %s",
                         b->header.path, v);
+        if (!strcmp(k, "converted_layout") && !strcmp(v, "comfyui_minimax_h3"))
+            continue;
         if (strstr(k, "dora") || strstr(k, "rslora") || strstr(k, "scaling") ||
-            strstr(k, "layout") || !strcmp(k, "ss_network_alpha") ||
-            !strcmp(k, "ss_network_args"))
+            strstr(k, "layout") || !strcmp(k, "ss_network_args"))
             return fail(e, en, "adapter %s: unsupported scaling/layout metadata %s=%s",
                         b->header.path, k, v);
     }
@@ -278,7 +347,7 @@ static int append_adapter(h3_lora_stack *stack, entry *ent, const h3_weight_stor
         free(resolved);
         return fail(error, error_size, "adapter indexing allocation failed");
     }
-    size_t pairs = 0, defaults = 0;
+    size_t pairs = 0, defaults = 0, conflicts = 0;
     for (size_t index = 0; index < header->tensor_count; index++) {
         if (seen[index])
             continue;
@@ -353,8 +422,8 @@ static int append_adapter(h3_lora_stack *stack, entry *ent, const h3_weight_stor
                  ent->spec.path, first->name, native);
             goto invalid;
         }
-        if (a->ndim != 2 || b->ndim != 2 || !matrix_dtype(a->dtype) ||
-            !matrix_dtype(b->dtype) || !a->shape[0] || a->shape[0] > INT_MAX ||
+        if (a->ndim != 2 || b->ndim != 2 || !factor_dtype(a->dtype) ||
+            !factor_dtype(b->dtype) || !a->shape[0] || a->shape[0] > INT_MAX ||
             a->shape[1] != columns || b->shape[0] != rows ||
             b->shape[1] != a->shape[0]) {
             fail(error, error_size,
@@ -363,21 +432,28 @@ static int append_adapter(h3_lora_stack *stack, entry *ent, const h3_weight_stor
             goto invalid;
         }
         size_t rank = (size_t)a->shape[0];
-        float alpha_value = (float)rank;
+        if (data->dynamic_alpha && !alpha && !data->baked_alpha) {
+            fail(error, error_size, "adapter %s target %s: Dynamic alpha requires tensor alpha or declared baked normalization",
+                 ent->spec.path, native);
+            goto invalid;
+        }
+        float alpha_value = data->has_metadata_alpha ? data->metadata_alpha : (float)rank;
         if (!data->min_rank || rank < data->min_rank)
             data->min_rank = rank;
         if (rank > data->max_rank)
             data->max_rank = rank;
         if (alpha) {
-            if (!matrix_dtype(alpha->dtype) || h3_st_tensor_elements(alpha) != 1 ||
+            if (!factor_dtype(alpha->dtype) || h3_st_tensor_elements(alpha) != 1 ||
                 alpha->ndim > 1) {
                 fail(error, error_size,
-                     "adapter %s target %s: alpha must be scalar F32/BF16",
+                     "adapter %s target %s: alpha must be scalar F32/BF16/F16",
                      ent->spec.path, native);
                 goto invalid;
             }
             alpha_value = value(data->bytes + alpha->file_offset, alpha->dtype, 0);
-        } else
+            if (data->has_metadata_alpha && alpha_value != data->metadata_alpha)
+                conflicts++;
+        } else if (!data->has_metadata_alpha)
             defaults++;
         float scale = ent->spec.strength * (alpha_value / (float)rank);
         if (!isfinite(alpha_value) || alpha_value < 0 || !isfinite(scale)) {
@@ -448,6 +524,7 @@ static int append_adapter(h3_lora_stack *stack, entry *ent, const h3_weight_stor
                     ent->spec.path);
     data->pairs = pairs;
     data->default_alpha = defaults;
+    data->alpha_conflicts = conflicts;
     return 1;
 invalid:
     free(resolved);
@@ -622,6 +699,12 @@ void h3_lora_stack_report(const h3_lora_stack *s, FILE *out) {
             "scale=strength*alpha/rank, absent alpha defaults to rank (%zu targets)\n",
             ent->spec.path, ent->spec.strength, b->hex, b->pairs, b->min_rank,
             b->max_rank, b->default_alpha);
+        if (b->has_metadata_alpha)
+            fprintf(out, "    ss_network_alpha=%.9g fallback; %zu explicit tensor "
+                         "conflicts overridden by tensor alpha.\n",
+                    b->metadata_alpha, b->alpha_conflicts);
+        if (b->baked_alpha)
+            fprintf(out, "    Declared baked scaling already in factors; not applied again.\n");
         for (size_t m = 0; m < b->header.metadata_count; m++) {
             if (!strcmp(b->header.metadata_keys[m], "partial_conversion") &&
                 !strcmp(b->header.metadata_values[m], "true"))
@@ -630,7 +713,7 @@ void h3_lora_stack_report(const h3_lora_stack *s, FILE *out) {
         }
     }
     fprintf(out,
-            "  FL2VA only; immutable for this context; SSD streaming unsupported.\n");
+            "  Immutable for this context; bound to validated transformer; SSD streaming unsupported.\n");
 }
 size_t h3_lora_scratch_bytes(const h3_lora_target *t, size_t rows) {
     if (!t || rows > ROWS || !rows ||
@@ -654,7 +737,7 @@ int h3_lora_merge_rows(const h3_lora_target *t, uint64_t first, size_t rows,
     memset(delta, 0, rows * n * sizeof(float));
     for (size_t f = 0; f < t->factor_count; f++) {
         const h3_lora_factor *p = &t->factors[f];
-        if (!p->rank || !matrix_dtype(p->a_dtype) || !matrix_dtype(p->b_dtype) ||
+        if (!p->rank || !factor_dtype(p->a_dtype) || !factor_dtype(p->b_dtype) ||
             !isfinite(p->scale))
             return fail(e, en, "invalid composition factor");
         for (size_t r = 0; r < p->rank; r += RANK) {

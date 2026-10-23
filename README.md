@@ -12,21 +12,33 @@ H3-specific Metal performance and memory optimization on M3 Max and M5 Max.
 ## Immutable multi-LoRA loading
 
 Repeat `--lora PATH STRENGTH` to compose independent signed, finite strengths
-into FL2VA transformer weights at load time, before existing int8 quantization:
+into the selected transformer weights at load time, before existing int8 quantization:
 
 ```sh
-./h3 -d "$MODEL_DIR" --lora "$STYLE_LORA" 0.65 --lora "$TURBO_LORA" 1.0 \
-  -p "A fully clothed adult in a blue jacket steps over a low hurdle in a sunny park." \
-  --width 512 --height 512 --frames 39 --steps 8 \
+./h3 -d "$MODEL_DIR" \
+  --lora "$LIGHTX_V12_LORA" 1.0 --lora "$UNLOCKED_V21_LORA" 0.5 \
+  -p "A fully clothed adult in a blue jacket walks and waves in a sunny park." \
+  --sampler res_multistep --scheduler simple --video-shift 12 --audio-shift 3 \
+  --width 1344 --height 768 --frames 22 --steps 5 \
   --layers 50 --reuse 1 --core-reuse 1 -o outputs/park.mp4
 ```
 
-These strengths/steps illustrate the interface, not verified quality advice.
+This selects Lightx 768p v1.2 at strength 1 and Unlocked v2.1 at 0.5, the
+Unlocked author's recommended starting strength. Lightx's card recommends
+RES/simple with at least five steps; 12/3 shifts are adopted H3 defaults where
+the card is silent. Unlocked instead recommends Euler ancestral: this example
+deliberately prioritizes the Turbo sampler, not simultaneous compliance with
+both cards. The aligned 1344x768 canvas and 22 frames give a 0.917-second smoke
+clip, not a full quality comparison. See [the measured result](TURBO_DESIGN.md#combined-768p-smoke).
 Both operands are mandatory; scientific notation and negative strengths work.
 Zero strength disables an entry without opening its path (even a missing path).
 Repeated files contribute repeatedly. Unknown/unsupported tensors fail rather
-than being skipped. Active adapters require resident FL2VA: SSD streaming and
-ordered Ref2VA references are rejected. First/last-frame FL2VA remains available.
+than being skipped. Active adapters require resident weights: SSD streaming is
+rejected. `--lora-model fl2va` (default) targets FL2VA and permits first/last-frame
+anchors; `--lora-model ref2va` validates against the actual Ref2VA transformer
+and requires an ordered `--ref-image PATH` with `--ref-image-size match`.
+The immutable target must match the generation request. Without active adapters,
+ordered references still automatically select Ref2VA as before.
 
 The stack is immutable: `!status` reports it, and changing adapters/strengths
 requires a new process/context. Cache clearing retains adapter snapshots;
@@ -34,10 +46,29 @@ source-file replacement does not change a live context. `--info` with active
 adapters validates and snapshots their payloads, although base payloads remain
 unloaded. Startup reports hashes, strengths, scaling/rank policy and backing bytes.
 
-C callers use `h3_load_dir(model_dir, NULL, 0)` without adapters, or pass an
-array of `h3_lora_spec` and its count. Input paths/specifications may be freed
-after construction. `h3_get_loras(ctx, &count)` borrows the canonical active
-specifications until `h3_free`; `h3_params` is unchanged.
+C callers use `h3_load_dir(model_dir, NULL, 0, H3_LORA_FL2VA)` without adapters,
+or pass an array of `h3_lora_spec`, its count and an immutable `h3_lora_model`
+target. Input paths/specifications may be freed after construction.
+`h3_get_loras(ctx, &count)` borrows canonical active specifications until `h3_free`.
+The appended `h3_params` fields select sampler, scheduler and video/audio shifts;
+initialize with `H3_PARAMS_DEFAULT` to retain Euler/serving/12/3 behavior.
+
+## Turbo sampler selection
+
+`--sampler euler|lcm|res_multistep --scheduler serving|simple`
+and `--video-shift FLOAT --audio-shift FLOAT` expose explicit numerical contracts.
+The default Euler/serving/12/3 retains the existing GPU path and initialization.
+Serving supports Euler only. Simple uses the discrete 1,000-entry Comfy schedule
+and packed audiovisual state, not independent native audio/video Euler clocks.
+Simple requires 50 blocks, full output canvas, no token reduction, and
+`--reuse 1 --core-reuse 1`; unsupported combinations fail before encoding.
+LCM uses run-local seeded re-noising; seeds are not PyTorch-identical noise.
+See [the second Astra specification and recommendation record](TURBO_DESIGN.md).
+Sampler correctness and adapter loadability alone do not establish visual quality.
+The [comparison runner and exact artifact inventory](COMPARISON.md) cover all 21
+Turbo weights with per-family settings and a separately labelled DMAD sampler
+discrepancy. [Upstream PR/fork research](UPSTREAM_RESEARCH.md) keeps performance
+patches separate from the model comparison and records hardware-specific evidence.
 
 See [the Astra design and evidence record](LORA_DESIGN.md) for supported formats,
 layout provenance, exact artifact hashes and measured acceptance results.
