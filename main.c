@@ -2,6 +2,8 @@
 #include "h3_cli.h"
 #include "h3_host.h"
 #include "h3_terminal.h"
+#include "h3_internal.h"
+#include "h3_lora.h"
 
 #include <errno.h>
 #include <getopt.h>
@@ -12,6 +14,8 @@
 #include <string.h>
 #include <sys/stat.h>
 
+static h3_lora_spec *cli_loras;
+static void free_cli_loras(void) { free(cli_loras); cli_loras = NULL; }
 static void usage(const char *program) {
     fprintf(stderr,
         "Usage: %s -d MODEL_DIR [options]              # interactive\n"
@@ -33,6 +37,7 @@ static void usage(const char *program) {
         "      --core-reuse N     Core refresh: 1 exact, 4 fast, 6 aggressive\n"
         "      --token-reduction  Pair video tokens in middle DiT blocks\n"
         "      --ssd-streaming    Stream original BF16 DiT layers from SSD\n"
+        "      --lora PATH STRENGTH  Add immutable FL2VA adapter (repeatable)\n"
         "      --use-int8-row-fc2 Faster one-scale int8 FC2 (M5)\n"
         "      --use-reference-rope  Disable native 256 RoPE adaptation\n"
         "      --use-slower-bf16-mlp  Force close-reference BF16/MPS MLP\n"
@@ -58,7 +63,7 @@ static void usage(const char *program) {
         "      --show             Display a frame after every denoising step (M5)\n"
         "      --zoom N           Terminal image zoom (default: 2 for Retina)\n"
         "      --profile          Print per-phase Metal timing and allocation data\n"
-        "      --info             Inspect model/device without mapping weights\n"
+        "      --info             Inspect metadata/device; active adapters are snapshotted\n"
         "  -h, --help             Show this help\n",
         program, program, program);
 }
@@ -229,6 +234,8 @@ static int cli_frame(const h3_frame *frame, void *opaque) {
 }
 
 int main(int argc, char **argv) {
+    if (atexit(free_cli_loras) != 0) return 1;
+    size_t lora_count = 0, lora_capacity = 0;
     enum { OPT_WIDTH = 1000, OPT_HEIGHT, OPT_RENDER_WIDTH, OPT_RENDER_HEIGHT,
            OPT_FRAMES, OPT_SECONDS, OPT_STEPS, OPT_REUSE,
            OPT_LAYERS,
@@ -251,7 +258,7 @@ int main(int argc, char **argv) {
            OPT_FIRST, OPT_LAST, OPT_REF_IMAGE, OPT_REF_IMAGE_SIZE,
            OPT_REF_VIDEO, OPT_REF_SILENT_VIDEO, OPT_REF_VIDEO_AUDIO,
            OPT_REF_AUDIO, OPT_FRAMES_DIR, OPT_SHOW, OPT_ZOOM,
-           OPT_PROFILE, OPT_INFO };
+           OPT_PROFILE, OPT_INFO, OPT_LORA };
     static const struct option options[] = {
         {"model-dir", required_argument, NULL, 'd'},
         {"prompt", required_argument, NULL, 'p'},
@@ -268,6 +275,7 @@ int main(int argc, char **argv) {
         {"core-reuse", required_argument, NULL, OPT_CORE_REUSE},
         {"token-reduction", no_argument, NULL, OPT_TOKEN_REDUCTION},
         {"ssd-streaming", no_argument, NULL, OPT_SSD_STREAMING},
+        {"lora", required_argument, NULL, OPT_LORA},
         {"use-int8-row-fc2", no_argument, NULL, OPT_USE_INT8_ROW_FC2},
         {"use-reference-rope", no_argument, NULL, OPT_USE_REFERENCE_ROPE},
         {"use-slower-bf16-mlp", no_argument, NULL,
@@ -323,6 +331,43 @@ int main(int argc, char **argv) {
     int option;
     while ((option = getopt_long(argc, argv, "d:p:o:h", options, NULL)) != -1) {
         switch (option) {
+            case OPT_LORA: {
+                if (optind >= argc) {
+                    fprintf(stderr, "h3: --lora requires PATH STRENGTH\n");
+                    return 2;
+                }
+                const char *value = argv[optind++];
+                char *end = NULL;
+                errno = 0;
+                float strength = strtof(value, &end);
+                if (errno || end == value || *end || !isfinite(strength) ||
+                    strspn(value, "+-0123456789.eE") != strlen(value)) {
+                    fprintf(stderr, "h3: invalid LoRA strength: %s\n", value);
+                    return 2;
+                }
+                if (lora_count >= SIZE_MAX / sizeof(*cli_loras)) {
+                    fprintf(stderr, "h3: too many LoRA specifications\n");
+                    return 2;
+                }
+                if (lora_count == lora_capacity) {
+                    size_t max_count = SIZE_MAX / sizeof(*cli_loras);
+                    size_t capacity = lora_capacity ?
+                        (lora_capacity > max_count / 2 ? max_count :
+                         lora_capacity * 2) : 4;
+                    h3_lora_spec *grown = realloc(cli_loras,
+                        capacity * sizeof(*cli_loras));
+                    if (!grown) {
+                        fprintf(stderr, "h3: out of memory collecting LoRAs\n");
+                        return 1;
+                    }
+                    cli_loras = grown;
+                    lora_capacity = capacity;
+                }
+                cli_loras[lora_count++] = (h3_lora_spec){optarg, strength};
+                if (strength == 0.0f)
+                    fprintf(stderr, "h3: LoRA disabled (zero strength): %s\n", optarg);
+                break;
+            }
             case 'd': model_dir = optarg; break;
             case 'p': prompt = optarg; break;
             case 'o': output = optarg; break;
@@ -472,6 +517,13 @@ int main(int argc, char **argv) {
         fprintf(stderr, "h3: --seconds and --frames are mutually exclusive\n");
         return 2;
     }
+    int active_loras = 0;
+    for (size_t i = 0; i < lora_count; i++)
+        active_loras |= cli_loras[i].strength != 0.0f;
+    if (active_loras && (params.ssd_streaming || reference_count)) {
+        fprintf(stderr, "h3: active LoRAs require FL2VA without SSD streaming or ordered references\n");
+        return 2;
+    }
     if (prompt && params.steps >= 2 && params.steps <= 7 &&
         params.denoise_reuse > 1) {
         fprintf(stderr,
@@ -487,11 +539,13 @@ int main(int argc, char **argv) {
         return 1;
     }
     if (profile) setenv("H3_PROFILE", "1", 1);
-    h3_ctx *ctx = h3_load_dir(model_dir);
+    h3_ctx *ctx = h3_load_dir(model_dir, cli_loras, lora_count);
+    free_cli_loras();
     if (!ctx) {
         fprintf(stderr, "h3: %s\n", h3_last_error(NULL));
         return 1;
     }
+    if (ctx->loras) h3_lora_stack_report(ctx->loras, stderr);
     if (info) print_info(ctx);
     if (prompt) {
         params.output_path = output;

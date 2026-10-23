@@ -55,7 +55,15 @@ static char *h3_json_string(h3_json_cursor *cursor) {
         return NULL;
     }
     cursor->at++;
-    size_t maximum = (size_t)(cursor->end - cursor->at);
+    const char *closing = cursor->at;
+    while (closing < cursor->end && *closing != '"') {
+        if (*closing++ == '\\' && closing < cursor->end) closing++;
+    }
+    if (closing == cursor->end) {
+        h3_json_fail(cursor, "unterminated JSON string");
+        return NULL;
+    }
+    size_t maximum = (size_t)(closing - cursor->at);
     char *result = malloc(maximum + 1);
     if (!result) {
         h3_json_fail(cursor, "out of memory parsing safetensors header");
@@ -85,6 +93,7 @@ static char *h3_json_string(h3_json_cursor *cursor) {
                         codepoint = codepoint * 16 + digit;
                     }
                     cursor->at += 4;
+                    if (!codepoint) goto malformed;
                     if (codepoint < 0x80) {
                         result[length++] = (char)codepoint;
                     } else if (codepoint < 0x800) {
@@ -120,6 +129,9 @@ static int h3_json_uint(h3_json_cursor *cursor, uint64_t *result) {
     if (cursor->at >= cursor->end || *cursor->at < '0' || *cursor->at > '9') {
         return h3_json_fail(cursor, "expected unsigned JSON integer");
     }
+    if (*cursor->at == '0' && cursor->at + 1 < cursor->end &&
+        cursor->at[1] >= '0' && cursor->at[1] <= '9')
+        return h3_json_fail(cursor, "leading zero in JSON integer");
     uint64_t value = 0;
     while (cursor->at < cursor->end && *cursor->at >= '0' && *cursor->at <= '9') {
         unsigned digit = (unsigned)(*cursor->at - '0');
@@ -133,52 +145,6 @@ static int h3_json_uint(h3_json_cursor *cursor, uint64_t *result) {
     return 1;
 }
 
-static int h3_json_skip(h3_json_cursor *cursor);
-
-static int h3_json_skip_compound(h3_json_cursor *cursor, char open, char close) {
-    if (!h3_json_take(cursor, open)) return 0;
-    h3_json_ws(cursor);
-    if (cursor->at < cursor->end && *cursor->at == close) {
-        cursor->at++;
-        return 1;
-    }
-    for (;;) {
-        if (open == '{') {
-            char *key = h3_json_string(cursor);
-            if (!key) return 0;
-            free(key);
-            if (!h3_json_take(cursor, ':')) return 0;
-        }
-        if (!h3_json_skip(cursor)) return 0;
-        h3_json_ws(cursor);
-        if (cursor->at >= cursor->end) return h3_json_fail(cursor, "unterminated JSON value");
-        if (*cursor->at == close) {
-            cursor->at++;
-            return 1;
-        }
-        if (*cursor->at++ != ',') return h3_json_fail(cursor, "expected JSON comma");
-    }
-}
-
-static int h3_json_skip(h3_json_cursor *cursor) {
-    h3_json_ws(cursor);
-    if (cursor->at >= cursor->end) return h3_json_fail(cursor, "missing JSON value");
-    if (*cursor->at == '"') {
-        char *value = h3_json_string(cursor);
-        if (!value) return 0;
-        free(value);
-        return 1;
-    }
-    if (*cursor->at == '{') return h3_json_skip_compound(cursor, '{', '}');
-    if (*cursor->at == '[') return h3_json_skip_compound(cursor, '[', ']');
-    const char *start = cursor->at;
-    while (cursor->at < cursor->end && *cursor->at != ',' &&
-           *cursor->at != '}' && *cursor->at != ']' &&
-           *cursor->at != ' ' && *cursor->at != '\n' &&
-           *cursor->at != '\r' && *cursor->at != '\t') cursor->at++;
-    if (cursor->at == start) return h3_json_fail(cursor, "invalid JSON scalar");
-    return 1;
-}
 
 static h3_dtype h3_parse_dtype(const char *name) {
     if (!strcmp(name, "BOOL")) return H3_DTYPE_BOOL;
@@ -289,6 +255,7 @@ static int h3_parse_tensor(h3_json_cursor *cursor, h3_st_tensor *tensor) {
         }
         int ok = 1;
         if (!strcmp(key, "dtype")) {
+            if (have_dtype) { free(key); return h3_json_fail(cursor, "duplicate dtype"); }
             char *value = h3_json_string(cursor);
             if (!value) ok = 0;
             else {
@@ -297,13 +264,15 @@ static int h3_parse_tensor(h3_json_cursor *cursor, h3_st_tensor *tensor) {
             }
             free(value);
         } else if (!strcmp(key, "shape")) {
+            if (have_shape) { free(key); return h3_json_fail(cursor, "duplicate shape"); }
             ok = h3_parse_shape(cursor, tensor);
             have_shape = ok;
         } else if (!strcmp(key, "data_offsets")) {
+            if (have_offsets) { free(key); return h3_json_fail(cursor, "duplicate offsets"); }
             ok = h3_parse_offsets(cursor, tensor);
             have_offsets = ok;
         } else {
-            ok = h3_json_skip(cursor);
+            ok = h3_json_fail(cursor, "unsupported tensor descriptor field");
         }
         free(key);
         if (!ok) return 0;
@@ -311,6 +280,9 @@ static int h3_parse_tensor(h3_json_cursor *cursor, h3_st_tensor *tensor) {
         if (cursor->at >= cursor->end) return h3_json_fail(cursor, "unterminated tensor entry");
         if (*cursor->at == '}') continue;
         if (*cursor->at++ != ',') return h3_json_fail(cursor, "expected tensor comma");
+        h3_json_ws(cursor);
+        if (cursor->at < cursor->end && *cursor->at == '}')
+            return h3_json_fail(cursor, "trailing tensor comma");
     }
     if (!have_dtype || !have_shape || !have_offsets) {
         return h3_json_fail(cursor, "incomplete tensor descriptor");
@@ -364,6 +336,31 @@ static uint64_t h3_u64_le(const unsigned char bytes[8]) {
     return value;
 }
 
+static int parse_header_json(const char *path, char *json, uint64_t header_size,
+                             uint64_t file_size, h3_st_header *header,
+                             char *error, size_t error_size);
+
+int h3_st_read_memory(const void *bytes, size_t size, const char *name,
+                      h3_st_header *header, char *error, size_t error_size) {
+    if (error && error_size) snprintf(error, error_size, "invalid snapshot request");
+    if (!bytes || size < 8 || !header || !name) return 0;
+    if (error && error_size) error[0] = '\0';
+    memset(header, 0, sizeof(*header));
+    uint64_t length = h3_u64_le(bytes);
+    if (length > H3_ST_MAX_HEADER || length > size - 8) {
+        if (error && error_size) snprintf(error, error_size, "invalid snapshot header size");
+        return 0;
+    }
+    char *json = malloc((size_t)length + 1);
+    if (!json) {
+        if (error && error_size) snprintf(error, error_size, "out of memory parsing snapshot");
+        return 0;
+    }
+    memcpy(json, (const unsigned char *)bytes + 8, (size_t)length);
+    json[length] = 0;
+    return parse_header_json(name, json, length, size, header, error, error_size);
+}
+
 int h3_st_read_header(const char *path, h3_st_header *header,
                       char *error, size_t error_size) {
     if (!path || !header) return 0;
@@ -398,6 +395,12 @@ int h3_st_read_header(const char *path, h3_st_header *header,
     }
     close(descriptor);
     json[header_size] = '\0';
+    return parse_header_json(path, json, header_size, file_size, header, error, error_size);
+}
+
+static int parse_header_json(const char *path, char *json, uint64_t header_size,
+                             uint64_t file_size, h3_st_header *header,
+                             char *error, size_t error_size) {
     header->path = strdup(path);
     header->file_size = file_size;
     header->header_size = header_size;
@@ -408,6 +411,7 @@ int h3_st_read_header(const char *path, h3_st_header *header,
     }
     h3_json_cursor cursor = {json, json + header_size, error, error_size};
     size_t capacity = 0;
+    int have_metadata = 0;
     if (!h3_json_take(&cursor, '{')) goto fail;
     h3_json_ws(&cursor);
     if (cursor.at < cursor.end && *cursor.at == '}') cursor.at++;
@@ -419,11 +423,48 @@ int h3_st_read_header(const char *path, h3_st_header *header,
         }
         if (!strcmp(name, "__metadata__")) {
             free(name);
-            if (!h3_json_skip(&cursor)) goto fail;
+            if (have_metadata++) {
+                h3_json_fail(&cursor, "duplicate metadata object"); goto fail;
+            }
+            if (!h3_json_take(&cursor, '{')) goto fail;
+            h3_json_ws(&cursor);
+            while (cursor.at < cursor.end && *cursor.at != '}') {
+                char *key = h3_json_string(&cursor);
+                if (!key || !h3_json_take(&cursor, ':')) { free(key); goto fail; }
+                char *value = h3_json_string(&cursor);
+                if (!value) { free(key); goto fail; }
+                for (size_t m = 0; m < header->metadata_count; m++) {
+                    if (!strcmp(key, header->metadata_keys[m])) {
+                        free(key); free(value);
+                        h3_json_fail(&cursor, "duplicate metadata key"); goto fail;
+                    }
+                }
+                size_t n = header->metadata_count;
+                char **keys = realloc(header->metadata_keys, (n + 1) * sizeof(char *));
+                if (!keys) { free(key); free(value); goto fail; }
+                header->metadata_keys = keys;
+                char **values = realloc(header->metadata_values, (n + 1) * sizeof(char *));
+                if (!values) { free(key); free(value); goto fail; }
+                header->metadata_values = values;
+                keys[n] = key; values[n] = value; header->metadata_count++;
+                h3_json_ws(&cursor);
+                if (cursor.at < cursor.end && *cursor.at == '}') break;
+                if (!h3_json_take(&cursor, ',')) goto fail;
+                h3_json_ws(&cursor);
+                if (cursor.at < cursor.end && *cursor.at == '}') {
+                    h3_json_fail(&cursor, "trailing metadata comma"); goto fail;
+                }
+            }
+            if (!h3_json_take(&cursor, '}')) goto fail;
         } else {
             h3_st_tensor tensor;
             memset(&tensor, 0, sizeof(tensor));
             tensor.name = name;
+            if (h3_st_find(header, name)) {
+                free(name);
+                h3_json_fail(&cursor, "duplicate tensor name");
+                goto fail;
+            }
             if (!h3_parse_tensor(&cursor, &tensor) ||
                 !h3_validate_tensor(&cursor, &tensor, 8 + header_size, file_size) ||
                 !h3_append_tensor(header, tensor, &capacity, &cursor)) {
@@ -450,6 +491,16 @@ int h3_st_read_header(const char *path, h3_st_header *header,
         h3_json_fail(&cursor, "trailing data in safetensors header");
         goto fail;
     }
+    for (size_t i = 0; i < header->tensor_count; i++) {
+        const h3_st_tensor *a = &header->tensors[i];
+        for (size_t j = 0; j < i; j++) {
+            const h3_st_tensor *b = &header->tensors[j];
+            if (a->data_begin < b->data_end && b->data_begin < a->data_end) {
+                h3_json_fail(&cursor, "overlapping tensor payloads");
+                goto fail;
+            }
+        }
+    }
     free(json);
     return 1;
 
@@ -464,6 +515,10 @@ void h3_st_free_header(h3_st_header *header) {
     for (size_t index = 0; index < header->tensor_count; index++) {
         free(header->tensors[index].name);
     }
+    for (size_t i = 0; i < header->metadata_count; i++) {
+        free(header->metadata_keys[i]); free(header->metadata_values[i]);
+    }
+    free(header->metadata_keys); free(header->metadata_values);
     free(header->tensors);
     free(header->path);
     memset(header, 0, sizeof(*header));

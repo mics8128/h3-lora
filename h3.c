@@ -11,6 +11,8 @@
 #include "h3_video_encoder.h"
 #include "h3_video_vae.h"
 #include "h3_vision_encoder.h"
+#include "h3_lora.h"
+#include "h3_weights.h"
 
 #include <errno.h>
 #include <math.h>
@@ -161,7 +163,7 @@ failed:
     return NULL;
 }
 
-static char *h3_prepared_key(const char *conditioning,
+static char *h3_prepared_key(const h3_ctx *ctx, const char *conditioning,
                              const h3_params *params,
                              int render_width, int render_height) {
     h3_key key = {0};
@@ -185,6 +187,11 @@ static char *h3_prepared_key(const char *conditioning,
             params->use_slower_uncached_int8_scales,
             params->use_slower_dynamic_fc1_k,
             params->use_slower_grouped_quantizer)) {
+        free(key.text);
+        return NULL;
+    }
+    if (ctx->loras && !h3_key_append(&key, "|loras=%s",
+            h3_lora_stack_identity(ctx->loras))) {
         free(key.text);
         return NULL;
     }
@@ -404,8 +411,13 @@ static int h3_inventory(h3_ctx *ctx, const char *relative,
     return ok;
 }
 
-h3_ctx *h3_load_dir(const char *model_dir) {
+h3_ctx *h3_load_dir(const char *model_dir, const h3_lora_spec *loras,
+                    size_t lora_count) {
     h3_global_error[0] = '\0';
+    if (lora_count && !loras) {
+        h3_set_error(NULL, "LoRA specifications are required");
+        return NULL;
+    }
     if (!model_dir || !*model_dir) {
         h3_set_error(NULL, "model directory is required");
         return NULL;
@@ -449,6 +461,32 @@ h3_ctx *h3_load_dir(const char *model_dir) {
         h3_free(ctx);
         return NULL;
     }
+    int active_loras = 0;
+    for (size_t i = 0; i < lora_count; i++) {
+        if (!isfinite(loras[i].strength)) {
+            h3_set_error(NULL, "LoRA strength must be finite");
+            h3_free(ctx);
+            return NULL;
+        }
+        active_loras |= loras[i].strength != 0.0f;
+    }
+    if (active_loras) {
+        char *base_path = h3_path(model_dir, "FL2VA/transformer");
+        char detail[512] = "out of memory resolving FL2VA transformer";
+        h3_weight_store *base = base_path ? h3_weight_store_open(
+            base_path, detail, sizeof(detail)) : NULL;
+        free(base_path);
+        if (base) {
+            ctx->loras = h3_lora_stack_load(loras, lora_count, base,
+                                            detail, sizeof(detail));
+            h3_weight_store_free(base);
+        }
+        if (!ctx->loras) {
+            h3_set_error(NULL, "%s", detail);
+            h3_free(ctx);
+            return NULL;
+        }
+    }
     char metal_error[256];
     if (!h3_metal_probe(&ctx->device, metal_error, sizeof(metal_error))) {
         h3_set_error(ctx, "%s", metal_error);
@@ -462,8 +500,14 @@ h3_ctx *h3_load_dir(const char *model_dir) {
 void h3_free(h3_ctx *ctx) {
     if (!ctx) return;
     h3_cache_clear(ctx);
+    h3_lora_stack_free(ctx->loras);
     free(ctx->model_dir);
     free(ctx);
+}
+
+const h3_lora_spec *h3_get_loras(const h3_ctx *ctx, size_t *count) {
+    if (count) *count = 0;
+    return ctx && ctx->loras ? h3_lora_stack_specs(ctx->loras, count) : NULL;
 }
 
 const char *h3_last_error(const h3_ctx *ctx) {
@@ -854,6 +898,11 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
         return NULL;
     }
     if (!h3_valid_params(ctx, params)) return NULL;
+    if (ctx->loras && (params->ssd_streaming || params->reference_count)) {
+        h3_set_error(ctx,
+            "active LoRA stack requires FL2VA without SSD streaming or ordered references");
+        return NULL;
+    }
     int render_width = params->render_width ? params->render_width :
                                                params->width;
     int render_height = params->render_height ? params->render_height :
@@ -940,7 +989,7 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
         goto cleanup;
     }
     prepared_key = h3_prepared_key(
-        conditioning_key, params, render_width, render_height);
+        ctx, conditioning_key, params, render_width, render_height);
     if (!prepared_key) {
         h3_set_error(ctx, "out of memory constructing prepared-model cache key");
         goto cleanup;
@@ -1476,7 +1525,7 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
         fprintf(stderr, "h3: prepared DiT cache hit\n");
     } else if (conditioned) {
         dit = h3_dit_load_conditioned(
-            dit_path, "h3_shaders.metal", &text, &layout, &sigmas,
+            dit_path, ctx->loras, "h3_shaders.metal", &text, &layout, &sigmas,
             (unsigned)params->dit_layers, (unsigned)params->core_reuse,
             params->token_reduction,
             params->ssd_streaming,
@@ -1497,7 +1546,7 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
             h3_dit_progress_bridge, &progress, detail, sizeof(detail));
     } else {
         dit = h3_dit_load_t2va(
-            dit_path, "h3_shaders.metal", &text, &layout, &sigmas,
+            dit_path, ctx->loras, "h3_shaders.metal", &text, &layout, &sigmas,
             (unsigned)params->dit_layers, (unsigned)params->core_reuse,
             params->token_reduction,
             params->ssd_streaming,

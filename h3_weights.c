@@ -1,4 +1,6 @@
 #include "h3_weights.h"
+#include "h3_lora.h"
+#include <limits.h>
 
 #include <dirent.h>
 #include <stdarg.h>
@@ -9,6 +11,9 @@
 struct h3_weight_store {
     h3_st_header *headers;
     size_t count;
+    char *directory;
+    const h3_lora_stack *loras;
+    int loaded;
 };
 
 static void fail(char *error, size_t error_size, const char *format, ...) {
@@ -118,6 +123,7 @@ void h3_weight_store_free(h3_weight_store *store) {
     for (size_t index = 0; index < store->count; index++) {
         h3_st_free_header(&store->headers[index]);
     }
+    free(store->directory);
     free(store->headers);
     free(store);
 }
@@ -141,10 +147,38 @@ const h3_st_tensor *h3_weight_find(const h3_weight_store *store,
     return NULL;
 }
 
+const char *h3_weight_store_directory(const h3_weight_store *store) {
+    if (!store || !store->count) return NULL;
+    if (!store->directory) {
+        const char *path = store->headers[0].path;
+        const char *slash = strrchr(path, '/');
+        char *parent = slash ? strndup(path, (size_t)(slash - path)) : strdup(".");
+        if (!parent) return NULL;
+        char *canonical = realpath(*parent ? parent : "/", NULL);
+        free(parent);
+        if (!canonical) return NULL;
+        ((h3_weight_store *)store)->directory = canonical;
+    }
+    return store->directory;
+}
+
+int h3_weight_store_bind_loras(h3_weight_store *store, const h3_lora_stack *stack,
+                              char *error, size_t error_size) {
+    if (!store || !stack || store->loaded || store->loras ||
+        !h3_weight_store_directory(store) ||
+        strcmp(store->directory, h3_lora_stack_base(stack))) {
+        fail(error, error_size, "LoRA binding requires the original base component before any payload load");
+        return 0;
+    }
+    store->loras = stack;
+    return 1;
+}
+
 static h3_gpu_tensor *load_tensor(const h3_weight_store *store, h3_gpu *gpu,
                                   const char *name, int ndim,
                                   const uint64_t *shape, h3_dtype dtype,
                                   char *error, size_t error_size) {
+    if (store) ((h3_weight_store *)store)->loaded = 1;
     const h3_st_header *header = NULL;
     const h3_st_tensor *tensor = h3_weight_find(store, name, &header);
     if (!tensor) {
@@ -173,6 +207,11 @@ static h3_gpu_tensor *load_tensor(const h3_weight_store *store, h3_gpu *gpu,
     if (elements > SIZE_MAX) {
         fail(error, error_size, "weight %s is too large for this process", name);
         return NULL;
+    }
+    if (store->loras) {
+        const h3_lora_target *target = h3_lora_find_target(store->loras, name);
+        if (target) return h3_lora_load_target(target, gpu, header, tensor,
+                                               error, error_size);
     }
     h3_gpu_tensor *result = dtype == H3_DTYPE_BF16 ?
         h3_gpu_tensor_load_bf16(gpu, header->path, tensor->file_offset,

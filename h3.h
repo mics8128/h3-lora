@@ -169,8 +169,17 @@ struct h3_result {
     uint64_t seed;
 };
 
-/* Load model metadata and initialize the Metal device. Weights remain unmapped. */
-h3_ctx *h3_load_dir(const char *model_dir);
+typedef struct {
+    const char *path;
+    float strength;
+} h3_lora_spec;
+
+/* Load metadata, snapshot active adapters, then initialize Metal. Base model
+ * payloads remain unloaded. Input specifications are borrowed during this call. */
+h3_ctx *h3_load_dir(const char *model_dir, const h3_lora_spec *loras,
+                    size_t lora_count);
+/* Context-owned active specifications in canonical order, valid until free. */
+const h3_lora_spec *h3_get_loras(const h3_ctx *ctx, size_t *count);
 void h3_free(h3_ctx *ctx);
 
 const char *h3_last_error(const h3_ctx *ctx);

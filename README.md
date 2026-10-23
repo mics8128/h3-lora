@@ -9,7 +9,50 @@ Prompt-to-video/audio, first/last-frame conditioning, and ordered Ref2VA
 image/video/audio references work end to end. The current work is incremental
 H3-specific Metal performance and memory optimization on M3 Max and M5 Max.
 
+## Immutable multi-LoRA loading
+
+Repeat `--lora PATH STRENGTH` to compose independent signed, finite strengths
+into FL2VA transformer weights at load time, before existing int8 quantization:
+
+```sh
+./h3 -d "$MODEL_DIR" --lora "$STYLE_LORA" 0.65 --lora "$TURBO_LORA" 1.0 \
+  -p "A fully clothed adult in a blue jacket steps over a low hurdle in a sunny park." \
+  --width 512 --height 512 --frames 39 --steps 8 \
+  --layers 50 --reuse 1 --core-reuse 1 -o outputs/park.mp4
+```
+
+These strengths/steps illustrate the interface, not verified quality advice.
+Both operands are mandatory; scientific notation and negative strengths work.
+Zero strength disables an entry without opening its path (even a missing path).
+Repeated files contribute repeatedly. Unknown/unsupported tensors fail rather
+than being skipped. Active adapters require resident FL2VA: SSD streaming and
+ordered Ref2VA references are rejected. First/last-frame FL2VA remains available.
+
+The stack is immutable: `!status` reports it, and changing adapters/strengths
+requires a new process/context. Cache clearing retains adapter snapshots;
+source-file replacement does not change a live context. `--info` with active
+adapters validates and snapshots their payloads, although base payloads remain
+unloaded. Startup reports hashes, strengths, scaling/rank policy and backing bytes.
+
+C callers use `h3_load_dir(model_dir, NULL, 0)` without adapters, or pass an
+array of `h3_lora_spec` and its count. Input paths/specifications may be freed
+after construction. `h3_get_loras(ctx, &count)` borrows the canonical active
+specifications until `h3_free`; `h3_params` is unchanged.
+
+See [the Astra design and evidence record](LORA_DESIGN.md) for supported formats,
+layout provenance, exact artifact hashes and measured acceptance results.
+The two recorded artifacts passed individual and combined benign generation
+in BF16 and M5 default modes; this is not a claim of general style fidelity or
+four-step Turbo quality. Code remains MIT; model licenses are separate.
+Never commit weights, merged weights or media.
+
 ## Tutorial
+
+For this workflow, use the local clone only for source/docs and Git management.
+Run all builds, tests, adapter loading and inference on the capable remote
+machine in a separate checkout; keep real weights and generated media outside
+the checkout. The commands below run there, not on the resource-limited local
+machine. Local fixtures must remain tiny and synthetic.
 
 ### 1. Build and inspect the model
 

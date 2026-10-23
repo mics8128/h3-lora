@@ -4,6 +4,7 @@
 #include "h3_gpu.h"
 #include "h3_host.h"
 #include "h3_text_encoder.h"
+#include "h3_lora.h"
 
 #include <stddef.h>
 #include <stdint.h>
@@ -21,6 +22,7 @@ typedef int (*h3_dit_preview)(int completed_steps, int total_steps,
  * happen before the persistent core is loaded. SSD streaming retains only the
  * small block norms and two alternating BF16 matrix slots. */
 h3_dit *h3_dit_load_t2va(const char *weight_directory,
+                         const h3_lora_stack *loras,
                          const char *shader_source_path,
                          const h3_text_embedding *text,
                          const h3_layout *layout,
@@ -49,6 +51,7 @@ h3_dit *h3_dit_load_t2va(const char *weight_directory,
  * counts must exactly match layout.img_cond_rows/audio_cond_rows. */
 h3_dit *h3_dit_load_conditioned(
                          const char *weight_directory,
+                         const h3_lora_stack *loras,
                          const char *shader_source_path,
                          const h3_text_embedding *text,
                          const h3_layout *layout,

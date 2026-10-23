@@ -39,10 +39,14 @@ typedef struct {
     uint64_t header_size;
     h3_st_tensor *tensors;
     size_t tensor_count;
+    char **metadata_keys, **metadata_values;
+    size_t metadata_count;
 } h3_st_header;
 
 int h3_st_read_header(const char *path, h3_st_header *header,
                       char *error, size_t error_size);
+int h3_st_read_memory(const void *bytes, size_t size, const char *name,
+                      h3_st_header *header, char *error, size_t error_size);
 void h3_st_free_header(h3_st_header *header);
 const h3_st_tensor *h3_st_find(const h3_st_header *header, const char *name);
 uint64_t h3_st_tensor_elements(const h3_st_tensor *tensor);

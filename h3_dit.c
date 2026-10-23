@@ -1557,6 +1557,7 @@ static void schedule_report(int completed, int total, void *opaque) {
 }
 
 static h3_dit *load_dit(const char *weight_directory,
+                        const h3_lora_stack *loras,
                         const char *shader_source_path,
                         const h3_text_embedding *text,
                         const h3_layout *layout,
@@ -1593,6 +1594,11 @@ static h3_dit *load_dit(const char *weight_directory,
         fail(error, error_size, "invalid DiT load arguments");
         return NULL;
     }
+    if (loras && ssd_streaming) {
+        fail(error, error_size,
+             "active LoRA stack requires FL2VA without SSD streaming");
+        return NULL;
+    }
     h3_dit *dit = calloc(1, sizeof(*dit));
     if (!dit) {
         fail(error, error_size, "out of memory creating DiT model");
@@ -1627,6 +1633,8 @@ static h3_dit *load_dit(const char *weight_directory,
     dit->sigmas = *sigmas;
     dit->weights = h3_weight_store_open(weight_directory, error, error_size);
     if (!dit->weights) goto failed;
+    if (loras && !h3_weight_store_bind_loras(dit->weights, loras,
+                                             error, error_size)) goto failed;
     dit->gpu = h3_gpu_create(shader_source_path, error, error_size);
     if (!dit->gpu) goto failed;
     dit->nax_mlp = dit->fused_mlp && h3_gpu_has_nax_mlp(dit->gpu);
@@ -1673,6 +1681,23 @@ static h3_dit *load_dit(const char *weight_directory,
         error, error_size);
     if (dit->schedule) {
         configure_gate_ranked_blocks(dit);
+        if (loras && dit->active_block_count < H3_DIT_BLOCKS) {
+            static const char *const stems[] = {
+                "attn.qkv_proj", "attn.out_proj", "mlp.fc1", "mlp.fc2",
+                "adaln_proj.linear"
+            };
+            for (unsigned block = 0; block < H3_DIT_BLOCKS; block++) {
+                if (dit->block_active[block]) continue;
+                for (size_t i = 0; i < sizeof(stems) / sizeof(stems[0]); i++) {
+                    char name[96];
+                    snprintf(name, sizeof(name), "blocks.%u.%s.weight",
+                             block, stems[i]);
+                    if (h3_lora_find_target(loras, name))
+                        fprintf(stderr, "h3: LoRA target %s validated but not executed (layer thinning)\n",
+                                name);
+                }
+            }
+        }
         h3_dit_schedule_prune(dit->schedule, dit->block_active,
                               H3_DIT_BLOCKS);
     }
@@ -1699,6 +1724,7 @@ failed:
 }
 
 h3_dit *h3_dit_load_t2va(const char *weight_directory,
+                         const h3_lora_stack *loras,
                          const char *shader_source_path,
                          const h3_text_embedding *text,
                          const h3_layout *layout,
@@ -1721,7 +1747,7 @@ h3_dit *h3_dit_load_t2va(const char *weight_directory,
                          int use_int8_row_fc2,
                          h3_dit_progress progress, void *progress_opaque,
                          char *error, size_t error_size) {
-    return load_dit(weight_directory, shader_source_path, text, layout, sigmas,
+    return load_dit(weight_directory, loras, shader_source_path, text, layout, sigmas,
                     active_blocks, core_reuse_interval, token_reduction,
                     ssd_streaming,
                     spatial_rope_scale,
@@ -1741,6 +1767,7 @@ h3_dit *h3_dit_load_t2va(const char *weight_directory,
 
 h3_dit *h3_dit_load_conditioned(
                          const char *weight_directory,
+                         const h3_lora_stack *loras,
                          const char *shader_source_path,
                          const h3_text_embedding *text,
                          const h3_layout *layout,
@@ -1767,7 +1794,7 @@ h3_dit *h3_dit_load_conditioned(
                          size_t condition_audio_elements,
                          h3_dit_progress progress, void *progress_opaque,
                          char *error, size_t error_size) {
-    return load_dit(weight_directory, shader_source_path, text, layout, sigmas,
+    return load_dit(weight_directory, loras, shader_source_path, text, layout, sigmas,
                     active_blocks, core_reuse_interval, token_reduction,
                     ssd_streaming,
                     spatial_rope_scale,

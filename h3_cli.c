@@ -4,6 +4,8 @@
 #include "h3_host.h"
 #include "h3_terminal.h"
 #include "linenoise.h"
+#include "h3_internal.h"
+#include "h3_lora.h"
 
 #include <ctype.h>
 #include <errno.h>
@@ -148,6 +150,7 @@ static int cli_frame(const h3_frame *frame, void *opaque) {
 
 static void print_help(void) {
     puts("Commands:");
+    puts("  LoRAs are fixed: changing paths/strengths requires a new process/context.");
     puts("  !help                    Show this help");
     puts("  !status                  Show current settings");
     puts("  !seed [N|random]         Set or show the seed");
@@ -181,6 +184,8 @@ static void print_help(void) {
 }
 
 static void print_status(const h3_cli_state *state) {
+    if (state->ctx->loras) h3_lora_stack_report(state->ctx->loras, stdout);
+    else puts("LoRA stack: none (fixed for this context)");
     int aligned = h3_align_frame_count(state->params.frames);
     printf("Size: %dx%d", state->params.width, state->params.height);
     if (state->params.render_width)
@@ -589,6 +594,8 @@ static int process_command(h3_cli_state *state, char *line, int *repeat) {
         int value;
         if (!parse_toggle(argument, state->params.ssd_streaming, &value))
             fprintf(stderr, "h3: use on or off\n");
+        else if (value && state->ctx->loras)
+            fprintf(stderr, "h3: SSD streaming is unsupported with the fixed LoRA stack\n");
         else if (value && state->params.use_int8_row_fc2)
             fprintf(stderr,
                     "h3: disable !int8-row-fc2 before SSD streaming\n");

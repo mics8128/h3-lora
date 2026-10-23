@@ -8,6 +8,10 @@
 #include <stdint.h>
 
 typedef struct h3_weight_store h3_weight_store;
+typedef struct h3_lora_stack h3_lora_stack;
+const char *h3_weight_store_directory(const h3_weight_store *store);
+int h3_weight_store_bind_loras(h3_weight_store *store, const h3_lora_stack *stack,
+                              char *error, size_t error_size);
 
 /* Open every safetensors header in a component directory without reading
  * tensor payloads. */
