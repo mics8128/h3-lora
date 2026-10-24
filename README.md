@@ -36,7 +36,8 @@ Repeated files contribute repeatedly. Unknown/unsupported tensors fail rather
 than being skipped. Active adapters require resident weights: SSD streaming is
 rejected. `--lora-model fl2va` (default) targets FL2VA and permits first/last-frame
 anchors; `--lora-model ref2va` validates against the actual Ref2VA transformer
-and requires an ordered `--ref-image PATH` with `--ref-image-size match`.
+and accepts ordered image, video, audio-only, and mixed references with `match`
+or `max` image sizing. `match` avoids unnecessary image-token cost.
 The immutable target must match the generation request. Without active adapters,
 ordered references still automatically select Ref2VA as before.
 
@@ -106,11 +107,27 @@ Without `-p`, the same binary starts an Iris-style interactive session:
 ./h3 -d ./MiniMax-H3 --width 512 --height 512 --steps 6
 ```
 
-Type a prompt to generate a numbered video. The session keeps the exact BF16
-prompt conditioning, prepared DiT, and video decoder in memory, so repeating a
-prompt with another seed avoids loading and encoding them again. Useful commands
-are `!status`, `!seed random`, `!seconds 2`, `!show`, `!save output.mp4`, and
-`!cache`. Use `!help` for the full, short list.
+Type a prompt to generate a numbered video. The session keeps prompt conditioning,
+the resident DiT weights and video decoder in memory. Changing only the seed reuses
+the prepared request; changing the prompt, steps, canvas or references rebuilds the
+affected request state without reloading compatible full-core weights. An unchanged
+sigma schedule and conditioning-modality policy also reuse AdaLN precomputation.
+Useful commands are `!status`, `!seed random`, `!seconds 2`, `!show`, `!save output.mp4`,
+and `!cache`. Use `!help` for the full, short list.
+
+This is automatic in the existing interactive mode: no new cache or backend flags.
+`!cache clear` explicitly releases the retained model and decoder. Reference/anchor
+edits no longer force a full cache clear; owned input signatures select the correct
+conditioning and request state. SSD streaming, token reduction, thinned cores and
+small-sequence precision-policy transitions retain conservative reload behavior.
+Changing adapter weights/strengths still requires a new context. A one-shot `-p`
+process exits after its output, so it cannot retain RAM for a later process.
+
+Cold loading also composes large LoRA targets using two bounded, independent row
+workers, preserving the original 128-row/64-rank arithmetic. Each block's enabled
+weight quantizers share one synchronous submission; numerical precision, steps,
+resolution and layers are unchanged. See [Astra's proposal](ASTRA_OPTIMIZATION_PLAN.md)
+and [the research / measured results](COMFY_CACHE_RESEARCH.md).
 
 First/last-frame conditioning is persistent in the session:
 
@@ -473,9 +490,59 @@ the media semantics:
 ```
 
 Reference flags may be repeated and their command-line order is preserved.
-Standalone audio must accompany an image or video reference. Audio references
+Standalone audio may be used alone or with image/video references. Audio references
 must be 2–15 seconds; at most three audio inputs are accepted and their total
-decoded duration is capped at 15 seconds.
+decoded duration is capped at 15 seconds. Embedded/replacement video soundtracks
+also require at least two seconds of decoded video: request at least 56 output
+frames and supply a source video of at least two seconds.
+
+### Ref2VA with LoRA: one loader, distinct model targets
+
+All reference kinds use the same `--lora PATH STRENGTH` loader; there is no separate
+image/video/audio LoRA file-format selector. Select a **Ref2VA-trained** adapter and
+`--lora-model ref2va` for these requests. FL2VA Turbo weights are not interchangeable
+with Ref2VA Turbo, even when tensor shapes happen to validate.
+
+The loader recognizes native/Comfy H3 fused-QKV tensor names and explicit Kohya
+aliases in safetensors, with F32/BF16/F16 factors and supported alpha declarations.
+It does **not** accept arbitrary Diffusers/PEFT split-QKV modules or `.default`
+factor suffixes. Prefer the published **ComfyUI** artifact; do not rename keys or
+assume that the `.safetensors` extension establishes compatibility. Unknown keys
+fail instead of being silently ignored.
+
+```sh
+# MODEL_DIR contains the actual Ref2VA checkpoint plus required shared assets.
+# REF_TURBO points to the Ref2VA v1.0 8-step ComfyUI weight, not FL2VA v1.2.
+./h3 -d "$MODEL_DIR" --lora "$REF_TURBO" 1 --lora-model ref2va \
+  --scheduler simple --sampler res_multistep --steps 8 \
+  --layers 50 --reuse 1 --core-reuse 1 --video-shift 12 --audio-shift 3 \
+  --width 1344 --height 768 --frames 56 \
+  --ref-image person.png --ref-image product.png \
+  -p 'The adult from <Picture 1> holds the product from <Picture 2>.' \
+  -o outputs/person-product.mp4
+```
+
+Replace the two image flags with the required reference input:
+
+| Intent | Flags |
+|---|---|
+| Motion/camera reference, ignoring source sound | `--ref-silent-video motion.mp4` |
+| Audio-only reference | `--ref-audio ambience.wav` |
+| Image plus audio | `--ref-image person.png --ref-audio ambience.wav` |
+| Video with its embedded soundtrack | `--ref-video source-with-sound.mp4` |
+| Video with an explicit replacement soundtrack | `--ref-video-audio motion.mp4 replacement.wav` |
+| Separate video/audio references | `--ref-silent-video motion.mp4 --ref-audio ambience.wav` |
+
+Use `<Picture N>`, `<Video N>`, and `<Audio N>` in the prompt; numbering is per
+modality, following reference order. Paired soundtrack replacement is conditioning,
+not a guarantee that output audio is copied bit-exactly. Reference motion/camera
+guidance likewise does not guarantee exact trajectory transfer.
+
+Pure-audio presentation follows the [ComfyUI code path](https://github.com/Comfy-Org/ComfyUI/blob/7cebca52227c63b4180ceed448cbd7ad22903b6d/comfy/text_encoders/minimax.py):
+ordinary `<Audio N>: ` text plus prompt, AudioVAE latent conditioning, no fake
+image, no chat template, and no waveform input to Qwen. ModelTC's Diffusers wrapper
+has a stricter visual-reference requirement; these are different entry contracts.
+See [related-project research and actual wiring results](REF_COMPATIBILITY_RESEARCH.md).
 
 ## Tests and runtime requirements
 
@@ -492,6 +559,31 @@ toolchain. The test covers both an F32 diagnosis path and the production BF16
 storage path; wide BF16 matrix products and SDPA use cached MPSGraph graphs, with
 direct Metal correctness fallbacks. `make parity` runs only those Metal/MLX
 checks.
+
+Fixture-free `h3_reduction_tests` is included in `make test`: independent softmax
+and GroupNorm/SiLU oracles exercise multi-SIMD reductions, token boundaries
+32/33/168/257, and repeated identical GPU inputs. Shared reduction scratch must
+not be overwritten before every SIMD group has consumed the previous phase's
+maximum or mean. These checks caught and now guard the Qwen causal-GQA and visual
+encoder GroupNorm synchronization races; this is a correctness fix, not a lossy
+speed mode.
+
+Real-model cache regression is opt-in:
+
+```sh
+make h3_real_cache_test
+./h3_real_cache_test "$MODEL_DIR" "$TURBO_LORA" "$NEW_OUTPUT_DIR"
+# Use the actual Ref2VA root and a matching Ref2VA LoRA for multimodal checks:
+./h3_real_cache_test "$REF_MODEL_DIR" "$REF_TURBO_LORA" "$NEW_REF_OUTPUT_DIR" person.png ambience.wav
+# Use the literal 'none' in place of the adapter path to check no-LoRA residency.
+```
+
+It renders warm transitions and compares native RGB plus fully decoded audio
+against unique fresh-context oracles. Coverage includes seed, different-length
+prompt, steps/back, shape/back, explicit cache clear, cancellation/recovery, and
+optional audio removal/restoration. Restored settings reuse an already verified
+oracle instead of rendering duplicate fresh inputs. Five-step sampling here is
+an equivalence smoke, not a quality recommendation for every Turbo weight.
 
 FFmpeg and FFprobe must be available on `PATH` for media inputs and MP4 output
 (`H3_FFMPEG` and `H3_FFPROBE` may select explicit executables). Generated RGB24 and
@@ -751,8 +843,9 @@ VAE's causal `ceil(T/4)` compression, two-frame Qwen sampling, and timestamped
 0.999 clean latent plus 0.001 seeded noise, pinned to the audio condition
 timestep 1.0, and packed as width-32 rows on the same rotary timeline as visual
 references. Audio inputs are 2-15 seconds, at most three are
-accepted, their total decoded duration is capped at 15 seconds, and a standalone
-audio reference must be combined with an image or video reference.
+accepted, and their total decoded duration is capped at 15 seconds. Standalone
+audio-only Ref2VA is supported, including active Ref2VA LoRAs; its audio latent
+uses the target canvas timeline without a fabricated visual reference.
 
 The native audio encoder matches the corrected MLX oracle at relative L2
 `3.59e-6` on a real two-second stereo fixture. The correction is important: the
@@ -881,5 +974,7 @@ measured 256-thread kernel. `--use-slower-grouped-quantizer` forces the latter
 at every size for A/B comparison.
 
 The native baseline targets the original `FL2VA/` and `Ref2VA/` checkpoint
-trees. Model phases are loaded and released separately so the 33B transformer,
-Qwen encoder, and decoders never have to coexist in unified memory.
+trees. One-shot generation loads and releases phases separately. Interactive
+session caching intentionally keeps compatible DiT weights and the video decoder
+resident while rebuilding conditioning; peak memory therefore depends on the
+retained model, reference workload and workspace. `!cache clear` releases them.

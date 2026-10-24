@@ -2,6 +2,7 @@
 #include "h3_lora.h"
 #include <Accelerate/Accelerate.h>
 #include <CommonCrypto/CommonDigest.h>
+#include <dispatch/dispatch.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
@@ -782,23 +783,84 @@ int h3_lora_merge_rows(const h3_lora_target *t, uint64_t first, size_t rows,
     }
     return 1;
 }
+typedef struct {
+    const h3_lora_target *target;
+    const h3_st_tensor *base;
+    h3_gpu_tensor *result;
+    int fd, success;
+    size_t first_row, end_row, scratch_bytes, item;
+    void *scratch, *tile;
+    char error[512];
+} lora_load_job;
+
+static void load_target_rows(void *context, size_t index) {
+    lora_load_job *job = &((lora_load_job *)context)[index];
+    const h3_lora_target *t = job->target;
+    for (size_t row = job->first_row; row < job->end_row; row += ROWS) {
+        size_t count = t->rows - row;
+        if (count > ROWS) count = ROWS;
+        size_t bytes = count * t->columns * job->item, done = 0;
+        while (done < bytes) {
+            ssize_t n = pread(job->fd, (char *)job->tile + done, bytes - done,
+                (off_t)(job->base->file_offset + row * t->columns * job->item + done));
+            if (n < 0 && errno == EINTR) continue;
+            if (n <= 0) {
+                fail(job->error, sizeof(job->error), "cannot read base tile %s", job->base->name);
+                return;
+            }
+            done += (size_t)n;
+        }
+        if (!h3_lora_merge_rows(t, row, count, job->tile, job->scratch,
+                job->scratch_bytes, job->error, sizeof(job->error))) return;
+        int ok = t->dtype == H3_DTYPE_BF16 ?
+            h3_gpu_tensor_write_bf16_range(job->result, row * t->columns,
+                                           job->tile, count * t->columns) :
+            h3_gpu_tensor_write_f32_range(job->result, row * t->columns,
+                                          job->tile, count * t->columns);
+        if (!ok) {
+            fail(job->error, sizeof(job->error), "cannot upload adapted tile %s", job->base->name);
+            return;
+        }
+    }
+    job->success = 1;
+}
+
 h3_gpu_tensor *h3_lora_load_target(const h3_lora_target *t, h3_gpu *gpu,
                                    const h3_st_header *h, const h3_st_tensor *base,
                                    char *e, size_t en) {
-    if (!t || !h || !base || base->ndim != 2 || base->dtype != t->dtype ||
+    if (!t || !h || !base || !t->columns || !matrix_dtype(t->dtype) ||
+        base->ndim != 2 || base->dtype != t->dtype ||
         base->shape[0] != t->rows || base->shape[1] != t->columns ||
         t->rows > SIZE_MAX / t->columns) {
         fail(e, en, "composition base schema changed");
         return NULL;
     }
-    size_t elements = t->rows * t->columns, item = h3_dtype_size(t->dtype),
-           scratch_n = h3_lora_scratch_bytes(t, ROWS);
-    void *scratch = malloc(scratch_n), *tile = malloc(ROWS * t->columns * item);
+    size_t elements = t->rows * t->columns, item = h3_dtype_size(t->dtype);
+    size_t scratch_n = h3_lora_scratch_bytes(t, ROWS);
+    if (!scratch_n || t->columns > SIZE_MAX / ROWS / item) {
+        fail(e, en, "composition workspace size overflow");
+        return NULL;
+    }
+    size_t tile_bytes = ROWS * t->columns * item;
+    if (scratch_n > SIZE_MAX - tile_bytes) {
+        fail(e, en, "composition workspace size overflow");
+        return NULL;
+    }
+    size_t tiles = t->rows / ROWS + (t->rows % ROWS != 0);
+    /* Two independent Accelerate calls avoid unbounded nested BLAS work.
+     * Small targets remain serial; additional workspace is capped at 64 MiB. */
+    size_t workers = tiles >= 4 && elements >= (16u * 1024u * 1024u) / item &&
+        scratch_n + tile_bytes <= (64u * 1024u * 1024u) / 2 ? 2 : 1;
+    lora_load_job jobs[2] = {{0}};
     h3_gpu_tensor *result = NULL;
     int fd = -1;
-    if (!scratch || !tile) {
-        fail(e, en, "composition workspace allocation failed");
-        goto invalid;
+    for (size_t i = 0; i < workers; i++) {
+        jobs[i].scratch = malloc(scratch_n);
+        jobs[i].tile = malloc(tile_bytes);
+        if (!jobs[i].scratch || !jobs[i].tile) {
+            fail(e, en, "composition workspace allocation failed");
+            goto invalid;
+        }
     }
     result = t->dtype == H3_DTYPE_BF16 ? h3_gpu_tensor_new_bf16(gpu, elements)
                                        : h3_gpu_tensor_new_f32(gpu, elements);
@@ -811,44 +873,40 @@ h3_gpu_tensor *h3_lora_load_target(const h3_lora_target *t, h3_gpu *gpu,
         fail(e, en, "cannot open base tensor %s", base->name);
         goto invalid;
     }
-    for (size_t row = 0; row < t->rows; row += ROWS) {
-        size_t count = t->rows - row;
-        if (count > ROWS)
-            count = ROWS;
-        size_t n = count * t->columns * item, done = 0;
-        while (done < n) {
-            ssize_t k =
-                pread(fd, (char *)tile + done, n - done,
-                      (off_t)(base->file_offset + row * t->columns * item + done));
-            if (k < 0 && errno == EINTR)
-                continue;
-            if (k <= 0) {
-                fail(e, en, "cannot read base tile %s", base->name);
-                goto invalid;
-            }
-            done += (size_t)k;
-        }
-        if (!h3_lora_merge_rows(t, row, count, tile, scratch, scratch_n, e, en))
-            goto invalid;
-        int ok = t->dtype == H3_DTYPE_BF16
-                     ? h3_gpu_tensor_write_bf16_range(result, row * t->columns, tile,
-                                                      count * t->columns)
-                     : h3_gpu_tensor_write_f32_range(result, row * t->columns, tile,
-                                                     count * t->columns);
-        if (!ok) {
-            fail(e, en, "cannot upload adapted tile %s", base->name);
+    for (size_t i = 0; i < workers; i++) {
+        jobs[i].target = t;
+        jobs[i].base = base;
+        jobs[i].result = result;
+        jobs[i].fd = fd;
+        jobs[i].item = item;
+        jobs[i].scratch_bytes = scratch_n;
+        jobs[i].first_row = (tiles * i / workers) * ROWS;
+        jobs[i].end_row = (tiles * (i + 1) / workers) * ROWS;
+    }
+    /* Only disjoint shared-buffer writes run concurrently. No GPU allocation,
+     * command submission or callback occurs until all row workers have joined. */
+    if (workers == 1) load_target_rows(jobs, 0);
+    else dispatch_apply_f(workers,
+        dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), jobs, load_target_rows);
+    for (size_t i = 0; i < workers; i++) {
+        if (!jobs[i].success) {
+            fail(e, en, "%s", jobs[i].error);
             goto invalid;
         }
     }
     close(fd);
-    free(scratch);
-    free(tile);
+    for (size_t i = 0; i < workers; i++) {
+        free(jobs[i].scratch);
+        free(jobs[i].tile);
+    }
     return result;
 invalid:
     if (fd >= 0)
         close(fd);
     h3_gpu_tensor_free(result);
-    free(scratch);
-    free(tile);
+    for (size_t i = 0; i < workers; i++) {
+        free(jobs[i].scratch);
+        free(jobs[i].tile);
+    }
     return NULL;
 }

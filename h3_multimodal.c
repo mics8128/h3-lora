@@ -162,6 +162,10 @@ static int encode_presentation(const char *weight_directory,
         fail(error, error_size, "multimodal presentation is too large");
         return 0;
     }
+    if (!span_count)
+        return h3_text_encode_bf16(
+            weight_directory, shader_source_path, ids->values, ids->count,
+            progress, progress_opaque, output, error, error_size);
     uint32_t *positions = calloc(3 * ids->count, sizeof(*positions));
     uint8_t *tags = malloc(ids->count);
     if (!positions || !tags) {
@@ -258,34 +262,26 @@ int h3_multimodal_encode_ref2va_bf16(
         return 0;
     }
     size_t span_count = 0;
-    int have_visual = 0;
     for (size_t index = 0; index < reference_count; index++) {
         const h3_reference_presentation *reference = &references[index];
         if (reference->kind == H3_PRESENTATION_IMAGE) {
             if (reference->has_audio || reference->vision_count != 1 ||
                 !reference->vision) goto invalid;
             span_count++;
-            have_visual = 1;
         } else if (reference->kind == H3_PRESENTATION_VIDEO) {
             if (!reference->vision || !reference->vision_count ||
                 !reference->timestamps ||
                 span_count > SIZE_MAX - reference->vision_count) goto invalid;
             span_count += reference->vision_count;
-            have_visual = 1;
         } else if (reference->kind == H3_PRESENTATION_AUDIO) {
             if (!reference->has_audio || reference->vision ||
                 reference->vision_count) goto invalid;
         } else goto invalid;
     }
-    if (!have_visual || !span_count) {
-        fail(error, error_size,
-             "Ref2VA audio requires an image or video reference");
-        return 0;
-    }
     h3_ids ids = {0};
-    h3_text_vision_span *spans = calloc(span_count, sizeof(*spans));
-    const h3_vision_output **visions = calloc(span_count, sizeof(*visions));
-    if (!spans || !visions) goto oom;
+    h3_text_vision_span *spans = span_count ? calloc(span_count, sizeof(*spans)) : NULL;
+    const h3_vision_output **visions = span_count ? calloc(span_count, sizeof(*visions)) : NULL;
+    if (span_count && (!spans || !visions)) goto oom;
     size_t span_index = 0;
     size_t image_ordinal = 0, video_ordinal = 0, audio_ordinal = 0;
     for (size_t index = 0; index < reference_count; index++) {

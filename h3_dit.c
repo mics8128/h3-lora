@@ -693,74 +693,54 @@ static void *read_stream_layer_thread(void *opaque) {
     return NULL;
 }
 
-static int quantize_block_mlp(h3_dit *dit, h3_dit_block *block,
-                              char *error, size_t error_size) {
-    block->fc1_int8 = h3_gpu_tensor_new_i8(
-        dit->gpu, (size_t)FFN * 2 * HIDDEN);
-    block->fc1_scales = h3_gpu_tensor_new_f32(dit->gpu, FFN * 2);
-    block->fc2_int8 = h3_gpu_tensor_new_i8(
-        dit->gpu, (size_t)HIDDEN * FFN);
-    block->fc2_scales = h3_gpu_tensor_new_f32(dit->gpu, HIDDEN);
-    int ok = block->fc1_int8 && block->fc1_scales &&
-             block->fc2_int8 && block->fc2_scales &&
-             h3_gpu_begin(dit->gpu) &&
-             h3_gpu_quantize_weight_int8(
-                 dit->gpu, block->fc1_int8, block->fc1_scales, block->fc1,
-                 FFN * 2, HIDDEN) &&
-             h3_gpu_quantize_weight_int8(
-                 dit->gpu, block->fc2_int8, block->fc2_scales, block->fc2,
-                 HIDDEN, FFN) &&
-             h3_gpu_submit(dit->gpu);
+static int quantize_block(h3_dit *dit, h3_dit_block *block,
+                           char *error, size_t error_size) {
+    struct {
+        int enabled, keep;
+        uint32_t rows, columns;
+        h3_gpu_tensor **source, **quantized, **scales;
+    } matrices[] = {
+        {dit->int8_mlp, dit->keep_bf16_mlp, FFN * 2, HIDDEN,
+         &block->fc1, &block->fc1_int8, &block->fc1_scales},
+        {dit->int8_mlp, dit->keep_bf16_mlp, HIDDEN, FFN,
+         &block->fc2, &block->fc2_int8, &block->fc2_scales},
+        {dit->int8_qkv, dit->keep_bf16_qkv, INNER * 3, HIDDEN,
+         &block->qkv, &block->qkv_int8, &block->qkv_scales},
+        {dit->int8_attention_out, dit->keep_bf16_attention_out, HIDDEN, INNER,
+         &block->out, &block->out_int8, &block->out_scales}
+    };
+    size_t count = sizeof(matrices) / sizeof(*matrices);
+    int enabled = 0;
+    for (size_t i = 0; i < count; i++) {
+        if (!matrices[i].enabled) continue;
+        enabled = 1;
+        *matrices[i].quantized = h3_gpu_tensor_new_i8(
+            dit->gpu, (size_t)matrices[i].rows * matrices[i].columns);
+        *matrices[i].scales = h3_gpu_tensor_new_f32(dit->gpu, matrices[i].rows);
+        if (!*matrices[i].quantized || !*matrices[i].scales) {
+            fail(error, error_size, "cannot allocate DiT quantized weights: %s",
+                 h3_gpu_error(dit->gpu));
+            return 0;
+        }
+    }
+    if (!enabled) return 1;
+    int ok = h3_gpu_begin(dit->gpu);
+    for (size_t i = 0; ok && i < count; i++) {
+        if (!matrices[i].enabled) continue;
+        ok = h3_gpu_quantize_weight_int8(
+            dit->gpu, *matrices[i].quantized, *matrices[i].scales,
+            *matrices[i].source, matrices[i].rows, matrices[i].columns);
+    }
+    if (ok) ok = h3_gpu_submit(dit->gpu);
     if (!ok) {
-        fail(error, error_size, "cannot quantize DiT MLP weights: %s",
+        fail(error, error_size, "cannot quantize DiT block weights: %s",
              h3_gpu_error(dit->gpu));
         return 0;
     }
-    if (!dit->keep_bf16_mlp) {
-        free_tensor(&block->fc1);
-        free_tensor(&block->fc2);
-    }
-    return 1;
-}
-
-static int quantize_block_qkv(h3_dit *dit, h3_dit_block *block,
-                              char *error, size_t error_size) {
-    block->qkv_int8 = h3_gpu_tensor_new_i8(
-        dit->gpu, (size_t)INNER * 3 * HIDDEN);
-    block->qkv_scales = h3_gpu_tensor_new_f32(dit->gpu, INNER * 3);
-    int ok = block->qkv_int8 && block->qkv_scales &&
-             h3_gpu_begin(dit->gpu) &&
-             h3_gpu_quantize_weight_int8(
-                 dit->gpu, block->qkv_int8, block->qkv_scales, block->qkv,
-                 INNER * 3, HIDDEN) &&
-             h3_gpu_submit(dit->gpu);
-    if (!ok) {
-        fail(error, error_size, "cannot quantize DiT QKV weight: %s",
-             h3_gpu_error(dit->gpu));
-        return 0;
-    }
-    if (!dit->keep_bf16_qkv) free_tensor(&block->qkv);
-    return 1;
-}
-
-static int quantize_block_attention_out(h3_dit *dit, h3_dit_block *block,
-                                        char *error, size_t error_size) {
-    block->out_int8 = h3_gpu_tensor_new_i8(
-        dit->gpu, (size_t)HIDDEN * INNER);
-    block->out_scales = h3_gpu_tensor_new_f32(dit->gpu, HIDDEN);
-    int ok = block->out_int8 && block->out_scales &&
-             h3_gpu_begin(dit->gpu) &&
-             h3_gpu_quantize_weight_int8(
-                 dit->gpu, block->out_int8, block->out_scales, block->out,
-                 HIDDEN, INNER) &&
-             h3_gpu_submit(dit->gpu);
-    if (!ok) {
-        fail(error, error_size,
-             "cannot quantize DiT attention-output weight: %s",
-             h3_gpu_error(dit->gpu));
-        return 0;
-    }
-    if (!dit->keep_bf16_attention_out) free_tensor(&block->out);
+    /* Submit is synchronous: no source is retired before its quantizer ends. */
+    for (size_t i = 0; i < count; i++)
+        if (matrices[i].enabled && !matrices[i].keep)
+            free_tensor(matrices[i].source);
     return 1;
 }
 
@@ -1260,15 +1240,8 @@ static int load_core(h3_dit *dit, h3_dit_progress progress, void *opaque,
         } else {
             if (!load_block(dit, &dit->blocks[index], prefix,
                             error, error_size)) return 0;
-            if (dit->int8_mlp &&
-                !quantize_block_mlp(dit, &dit->blocks[index],
-                                    error, error_size)) return 0;
-            if (dit->int8_qkv &&
-                !quantize_block_qkv(dit, &dit->blocks[index],
-                                    error, error_size)) return 0;
-            if (dit->int8_attention_out &&
-                !quantize_block_attention_out(
-                    dit, &dit->blocks[index], error, error_size)) return 0;
+            if (!quantize_block(dit, &dit->blocks[index],
+                                error, error_size)) return 0;
         }
         report(progress, opaque, "load transformer core", (int)index + 1,
                H3_DIT_BLOCKS);
@@ -1560,6 +1533,114 @@ static void schedule_report(int completed, int total, void *opaque) {
     report(state->callback, state->opaque, "precompute AdaLN", completed, total);
 }
 
+static void clear_request(h3_dit *dit, int keep_schedule);
+
+static int prepare_request(h3_dit *dit, const h3_lora_stack *loras,
+                           const h3_text_embedding *text,
+                           const h3_sigma_schedule *sigmas,
+                           const float *condition_video_rows,
+                           size_t condition_video_elements,
+                           const float *condition_audio_rows,
+                           size_t condition_audio_elements,
+                           int load_weights, h3_dit_progress progress,
+                           void *progress_opaque, char *error, size_t error_size) {
+    size_t wanted_video = (size_t)dit->video_condition_rows * VIDEO_PATCH;
+    size_t wanted_audio = (size_t)dit->audio_condition_rows * AUDIO_CHANNELS;
+    if (condition_video_elements != wanted_video ||
+        condition_audio_elements != wanted_audio ||
+        (wanted_video && !condition_video_rows) ||
+        (wanted_audio && !condition_audio_rows)) {
+        fail(error, error_size, "condition row elements do not match the packed DiT layout");
+        return 0;
+    }
+    dit->sigmas = *sigmas;
+    report(progress, progress_opaque, "refine text", 0, 1);
+    if (!refine_text(dit, text, error, error_size)) return 0;
+    report(progress, progress_opaque, "refine text", 1, 1);
+    if (!dit->schedule) {
+        schedule_progress schedule_state = {progress, progress_opaque};
+        dit->schedule = h3_dit_schedule_precompute(
+            dit->weights, dit->gpu, sigmas, dit->video_condition_rows != 0,
+            dit->audio_condition_rows != 0, schedule_report, &schedule_state,
+            error, error_size);
+        if (!dit->schedule) return 0;
+    }
+    configure_gate_ranked_blocks(dit);
+    if (loras && dit->active_block_count < H3_DIT_BLOCKS) {
+        static const char *const stems[] = {
+            "attn.qkv_proj", "attn.out_proj", "mlp.fc1", "mlp.fc2",
+            "adaln_proj.linear"
+        };
+        for (unsigned block = 0; block < H3_DIT_BLOCKS; block++) {
+            if (dit->block_active[block]) continue;
+            for (size_t i = 0; i < sizeof(stems) / sizeof(stems[0]); i++) {
+                char name[96];
+                snprintf(name, sizeof(name), "blocks.%u.%s.weight", block, stems[i]);
+                if (h3_lora_find_target(loras, name))
+                    fprintf(stderr, "h3: LoRA target %s validated but not executed (layer thinning)\n", name);
+            }
+        }
+    }
+    h3_dit_schedule_prune(dit->schedule, dit->block_active, H3_DIT_BLOCKS);
+    if (!prepare_rope(dit, error, error_size) ||
+        !prepare_maps(dit, text, error, error_size) ||
+        !prepare_projection_maps(dit, error, error_size) ||
+        !prepare_token_reduction_maps(dit, error, error_size) ||
+        (load_weights && !load_core(dit, progress, progress_opaque, error, error_size)) ||
+        !allocate_activations(dit, error, error_size)) return 0;
+    if ((wanted_video && !h3_gpu_tensor_write_f32_range(
+            dit->video_input, 0, condition_video_rows, wanted_video)) ||
+        (wanted_audio && !h3_gpu_tensor_write_f32_range(
+            dit->audio_input, 0, condition_audio_rows, wanted_audio))) {
+        fail(error, error_size, "cannot write persistent DiT condition rows");
+        return 0;
+    }
+    dit->core_forward_count = 0;
+    dit->core_residual_ready = 0;
+    h3_gpu_profile_mark(dit->gpu, load_weights ? "load" : "reprepare");
+    return 1;
+}
+
+int h3_dit_can_prepare_request(const h3_dit *dit, const h3_layout *layout) {
+    /* Thinned blocks depend on the schedule. Small sequences can change the
+     * actual int8 projection policy. Those cases retain full invalidation. */
+    return dit && layout && !dit->ssd_streaming && !dit->token_reduction &&
+        dit->active_block_count == H3_DIT_BLOCKS &&
+        dit->sequence >= 128 && layout->seq_len >= 128;
+}
+
+int h3_dit_prepare_request(h3_dit *dit, const h3_text_embedding *text,
+                           const h3_layout *layout, const h3_sigma_schedule *sigmas,
+                           float spatial_rope_scale,
+                           const float *condition_video_rows,
+                           size_t condition_video_elements,
+                           const float *condition_audio_rows,
+                           size_t condition_audio_elements,
+                           h3_dit_progress progress, void *progress_opaque,
+                           char *error, size_t error_size) {
+    if (!h3_dit_can_prepare_request(dit, layout) || !sigmas ||
+        sigmas->steps < 1 || sigmas->steps > H3_MAX_STEPS ||
+        !isfinite(spatial_rope_scale) || spatial_rope_scale <= 0.0f) {
+        fail(error, error_size, "incompatible resident DiT request");
+        return 0;
+    }
+    size_t clock_bytes = ((size_t)sigmas->steps + 1) * sizeof(float);
+    int keep_schedule = dit->schedule && sigmas->steps == dit->sigmas.steps &&
+        !memcmp(sigmas->video, dit->sigmas.video, clock_bytes) &&
+        !memcmp(sigmas->audio, dit->sigmas.audio, clock_bytes) &&
+        (dit->video_condition_rows != 0) == (layout->img_cond_rows != 0) &&
+        (dit->audio_condition_rows != 0) == (layout->audio_cond_rows != 0);
+    clear_request(dit, keep_schedule);
+    dit->spatial_rope_scale = spatial_rope_scale;
+    return copy_layout(dit, layout, error, error_size) &&
+        validate_layout(dit, text, error, error_size) &&
+        configure_token_reduction(dit, 0, error, error_size) &&
+        prepare_request(dit, NULL, text, sigmas,
+            condition_video_rows, condition_video_elements,
+            condition_audio_rows, condition_audio_elements, 0,
+            progress, progress_opaque, error, error_size);
+}
+
 static h3_dit *load_dit(const char *weight_directory,
                         const h3_lora_stack *loras,
                         const char *shader_source_path,
@@ -1622,18 +1703,6 @@ static h3_dit *load_dit(const char *weight_directory,
         !validate_layout(dit, text, error, error_size) ||
         !configure_token_reduction(dit, token_reduction,
                                    error, error_size)) goto failed;
-    size_t wanted_video_condition =
-        (size_t)dit->video_condition_rows * VIDEO_PATCH;
-    size_t wanted_audio_condition =
-        (size_t)dit->audio_condition_rows * AUDIO_CHANNELS;
-    if (condition_video_elements != wanted_video_condition ||
-        condition_audio_elements != wanted_audio_condition ||
-        (wanted_video_condition && !condition_video_rows) ||
-        (wanted_audio_condition && !condition_audio_rows)) {
-        fail(error, error_size,
-             "condition row elements do not match the packed DiT layout");
-        goto failed;
-    }
     dit->sigmas = *sigmas;
     dit->weights = h3_weight_store_open(weight_directory, error, error_size);
     if (!dit->weights) goto failed;
@@ -1675,52 +1744,10 @@ static h3_dit *load_dit(const char *weight_directory,
          getenv("H3_BENCH_INT8_MLP_AB") ||
          getenv("H3_INT8_MLP_STAGE"));
     h3_gpu_profile_set_label(dit->gpu, "H3 DiT");
-    report(progress, progress_opaque, "refine text", 0, 1);
-    if (!refine_text(dit, text, error, error_size)) goto failed;
-    report(progress, progress_opaque, "refine text", 1, 1);
-    schedule_progress schedule_state = {progress, progress_opaque};
-    dit->schedule = h3_dit_schedule_precompute(
-        dit->weights, dit->gpu, sigmas, dit->video_condition_rows != 0,
-        dit->audio_condition_rows != 0, schedule_report, &schedule_state,
-        error, error_size);
-    if (dit->schedule) {
-        configure_gate_ranked_blocks(dit);
-        if (loras && dit->active_block_count < H3_DIT_BLOCKS) {
-            static const char *const stems[] = {
-                "attn.qkv_proj", "attn.out_proj", "mlp.fc1", "mlp.fc2",
-                "adaln_proj.linear"
-            };
-            for (unsigned block = 0; block < H3_DIT_BLOCKS; block++) {
-                if (dit->block_active[block]) continue;
-                for (size_t i = 0; i < sizeof(stems) / sizeof(stems[0]); i++) {
-                    char name[96];
-                    snprintf(name, sizeof(name), "blocks.%u.%s.weight",
-                             block, stems[i]);
-                    if (h3_lora_find_target(loras, name))
-                        fprintf(stderr, "h3: LoRA target %s validated but not executed (layer thinning)\n",
-                                name);
-                }
-            }
-        }
-        h3_dit_schedule_prune(dit->schedule, dit->block_active,
-                              H3_DIT_BLOCKS);
-    }
-    if (!dit->schedule || !prepare_rope(dit, error, error_size) ||
-        !prepare_maps(dit, text, error, error_size) ||
-        !prepare_projection_maps(dit, error, error_size) ||
-        !prepare_token_reduction_maps(dit, error, error_size) ||
-        !load_core(dit, progress, progress_opaque, error, error_size) ||
-        !allocate_activations(dit, error, error_size)) goto failed;
-    if ((wanted_video_condition && !h3_gpu_tensor_write_f32_range(
-             dit->video_input, 0, condition_video_rows,
-             wanted_video_condition)) ||
-        (wanted_audio_condition && !h3_gpu_tensor_write_f32_range(
-             dit->audio_input, 0, condition_audio_rows,
-             wanted_audio_condition))) {
-        fail(error, error_size, "cannot write persistent DiT condition rows");
-        goto failed;
-    }
-    h3_gpu_profile_mark(dit->gpu, "load");
+    if (!prepare_request(dit, loras, text, sigmas,
+            condition_video_rows, condition_video_elements,
+            condition_audio_rows, condition_audio_elements, 1,
+            progress, progress_opaque, error, error_size)) goto failed;
     return dit;
 failed:
     h3_dit_free(dit);
@@ -3029,35 +3056,19 @@ int h3_dit_denoise_euler(h3_dit *dit, float *video_latent,
         progress, progress_opaque, NULL, NULL, error, error_size);
 }
 
-void h3_dit_free(h3_dit *dit) {
-    if (!dit) return;
+static void clear_request(h3_dit *dit, int keep_schedule) {
     int steps = h3_dit_schedule_steps(dit->schedule);
-    if (dit->row_maps) for (int step = 0; step < steps; step++)
-        h3_gpu_tensor_free(dit->row_maps[step]);
-    if (dit->reduced_row_maps) for (int step = 0; step < steps; step++)
-        h3_gpu_tensor_free(dit->reduced_row_maps[step]);
-    if (dit->final_audio_maps) for (int step = 0; step < steps; step++)
-        h3_gpu_tensor_free(dit->final_audio_maps[step]);
-    if (dit->final_video_maps) for (int step = 0; step < steps; step++)
-        h3_gpu_tensor_free(dit->final_video_maps[step]);
-    free(dit->row_maps);
-    free(dit->reduced_row_maps);
-    free(dit->final_audio_maps);
-    free(dit->final_video_maps);
+#define FREE_MAP(field) do { \
+    if (dit->field) for (int step = 0; step < steps; step++) \
+        h3_gpu_tensor_free(dit->field[step]); \
+    free(dit->field); dit->field = NULL; \
+} while (0)
+    FREE_MAP(row_maps); FREE_MAP(reduced_row_maps);
+    FREE_MAP(final_audio_maps); FREE_MAP(final_video_maps);
+#undef FREE_MAP
     free_tensor(&dit->refined_text);
-    free_tensor(&dit->rope_cos);
-    free_tensor(&dit->rope_sin);
-    free_tensor(&dit->reduced_rope_cos);
-    free_tensor(&dit->reduced_rope_sin);
-    free_tensor(&dit->video_patch_w); free_tensor(&dit->video_patch_b);
-    free_tensor(&dit->audio_patch_w); free_tensor(&dit->audio_patch_b);
-    for (unsigned block = 0; block < H3_DIT_BLOCKS; block++)
-        free_block(&dit->blocks[block]);
-    free_block(&dit->stream_slots[0]);
-    free_block(&dit->stream_slots[1]);
-    free_tensor(&dit->final_norm);
-    free_tensor(&dit->final_video_w); free_tensor(&dit->final_video_b);
-    free_tensor(&dit->final_audio_w); free_tensor(&dit->final_audio_b);
+    free_tensor(&dit->rope_cos); free_tensor(&dit->rope_sin);
+    free_tensor(&dit->reduced_rope_cos); free_tensor(&dit->reduced_rope_sin);
 #define FREE(field) free_tensor(&dit->field)
     if (dit->activation_aliases) {
         dit->attention_heads = NULL;
@@ -3081,7 +3092,36 @@ void h3_dit_free(h3_dit *dit) {
     FREE(audio_output_bf16); FREE(video_output_bf16);
     FREE(previous_audio_velocity); FREE(previous_video_velocity);
 #undef FREE
-    h3_dit_schedule_free(dit->schedule);
+    if (!keep_schedule) {
+        h3_dit_schedule_free(dit->schedule);
+        dit->schedule = NULL;
+    }
+    h3_layout_free(&dit->layout);
+    free(dit->forward_video_rows); dit->forward_video_rows = NULL;
+    free(dit->forward_audio_rows); dit->forward_audio_rows = NULL;
+    free(dit->forward_video_out); dit->forward_video_out = NULL;
+    free(dit->forward_audio_out); dit->forward_audio_out = NULL;
+    free(dit->forward_video_f32); dit->forward_video_f32 = NULL;
+    free(dit->forward_audio_f32); dit->forward_audio_f32 = NULL;
+    dit->activation_aliases = 0;
+    dit->token_original_in_qkv = 0;
+    dit->token_original_offset = 0;
+    dit->token_baseline_offset = 0;
+    dit->core_forward_count = 0;
+    dit->core_residual_ready = 0;
+}
+
+void h3_dit_free(h3_dit *dit) {
+    if (!dit) return;
+    clear_request(dit, 0);
+    free_tensor(&dit->video_patch_w); free_tensor(&dit->video_patch_b);
+    free_tensor(&dit->audio_patch_w); free_tensor(&dit->audio_patch_b);
+    for (unsigned block = 0; block < H3_DIT_BLOCKS; block++)
+        free_block(&dit->blocks[block]);
+    free_block(&dit->stream_slots[0]); free_block(&dit->stream_slots[1]);
+    free_tensor(&dit->final_norm);
+    free_tensor(&dit->final_video_w); free_tensor(&dit->final_video_b);
+    free_tensor(&dit->final_audio_w); free_tensor(&dit->final_audio_b);
     if (dit->ssd_streaming && getenv("H3_PROFILE")) {
         double gib = (double)dit->stream_bytes / (1024.0 * 1024.0 * 1024.0);
         fprintf(stderr,
@@ -3094,10 +3134,6 @@ void h3_dit_free(h3_dit *dit) {
     }
     h3_gpu_free(dit->gpu);
     h3_weight_store_free(dit->weights);
-    h3_layout_free(&dit->layout);
-    free(dit->forward_video_rows); free(dit->forward_audio_rows);
-    free(dit->forward_video_out); free(dit->forward_audio_out);
-    free(dit->forward_video_f32); free(dit->forward_audio_f32);
     free(dit);
 }
 

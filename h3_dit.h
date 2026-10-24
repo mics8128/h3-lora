@@ -81,6 +81,21 @@ h3_dit *h3_dit_load_conditioned(
                          char *error, size_t error_size);
 void h3_dit_free(h3_dit *dit);
 
+/* Rebuild request state while preserving resident full-core weights and GPU
+ * caches. The caller must first match model/adapter/precision identity. Small
+ * sequence policy transitions, SSD streaming and approximated cores reload. */
+int h3_dit_can_prepare_request(const h3_dit *dit, const h3_layout *layout);
+/* A failed preparation invalidates request state; the caller must free dit. */
+int h3_dit_prepare_request(h3_dit *dit, const h3_text_embedding *text,
+                           const h3_layout *layout, const h3_sigma_schedule *sigmas,
+                           float spatial_rope_scale,
+                           const float *condition_video_rows,
+                           size_t condition_video_elements,
+                           const float *condition_audio_rows,
+                           size_t condition_audio_elements,
+                           h3_dit_progress progress, void *progress_opaque,
+                           char *error, size_t error_size);
+
 /* Reset mutable sampler state and replace seed-dependent condition rows before
  * reusing an otherwise identical prepared transformer. */
 int h3_dit_reset_run(h3_dit *dit,

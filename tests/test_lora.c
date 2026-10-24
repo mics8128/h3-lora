@@ -339,6 +339,86 @@ static void quantization(h3_gpu *gpu) {
         h3_gpu_tensor_free(all[i]);
 }
 
+
+static void parallel_loader(h3_gpu *gpu) {
+    enum { ROW_COUNT = 1542, COLUMNS = 8191, FACTORS = 3 };
+    char path[] = "/tmp/h3-lora-rows-XXXXXX", error[512];
+    int fd = mkstemp(path);
+    require(fd >= 0, "parallel loader fixture");
+    close(fd);
+    h3_lora_factor factors[FACTORS];
+    void *a[FACTORS], *b[FACTORS];
+    h3_dtype types[] = {H3_DTYPE_BF16, H3_DTYPE_F16, H3_DTYPE_F32};
+    for (size_t f = 0; f < FACTORS; f++) {
+        size_t rank = 65 + f, item = h3_dtype_size(types[f]);
+        a[f] = malloc(rank * COLUMNS * item + 1);
+        b[f] = malloc(rank * ROW_COUNT * item + 1);
+        require(a[f] && b[f], "parallel factor allocation");
+        void *arrays[] = {a[f], b[f]};
+        size_t counts[] = {rank * COLUMNS, rank * ROW_COUNT};
+        for (size_t part = 0; part < 2; part++)
+            for (size_t i = 0; i < counts[part]; i++) {
+                if (types[f] == H3_DTYPE_F32) {
+                    float v = ((float)((i * 17 + f + part) % 23) - 11.0f) / 257.0f;
+                    memcpy((char *)arrays[part] + 1 + i * item, &v, item);
+                } else {
+                    uint16_t v = (uint16_t)((types[f] == H3_DTYPE_F16 ? 0x2800 : 0x3c00)
+                        + (i * 37 + f + part) % 512);
+                    if (i % 3 == 0) v |= 0x8000;
+                    memcpy((char *)arrays[part] + 1 + i * item, &v, item);
+                }
+            }
+        factors[f] = (h3_lora_factor){(char *)a[f] + 1, (char *)b[f] + 1,
+            types[f], types[f], rank, f == 1 ? -0.5f : 0.25f};
+    }
+    for (int format = 0; format < 2; format++) {
+        h3_dtype dtype = format ? H3_DTYPE_F32 : H3_DTYPE_BF16;
+        size_t elements = (size_t)ROW_COUNT * COLUMNS, item = h3_dtype_size(dtype);
+        void *expected = malloc(elements * item), *actual = malloc(elements * item);
+        require(expected && actual, "parallel merged allocation");
+        for (size_t i = 0; i < elements; i++) {
+            if (format) {
+                float v = 1.0f + (float)(i % 7) / 128.0f;
+                memcpy((char *)expected + i * item, &v, item);
+            } else {
+                uint16_t v = (uint16_t)(0x3f80 + i % 7);
+                memcpy((char *)expected + i * item, &v, item);
+            }
+        }
+        FILE *stream = fopen(path, "wb");
+        require(stream != NULL, "parallel base open");
+        require(fwrite(expected, item, elements, stream) == elements, "parallel base write");
+        require(!fclose(stream), "parallel base close");
+        h3_lora_target target = {.name = "parallel-qkv", .rows = ROW_COUNT,
+            .columns = COLUMNS, .dtype = dtype, .heads = 257, .head_dim = 2,
+            .factors = factors, .factor_count = FACTORS};
+        for (size_t row = 0; row < ROW_COUNT; row += 128) {
+            size_t count = ROW_COUNT - row;
+            if (count > 128) count = 128;
+            compose(&target, row, count, (char *)expected + row * COLUMNS * item);
+        }
+        h3_st_header header = {.path = path};
+        h3_st_tensor base = {.name = target.name, .dtype = dtype, .ndim = 2,
+                            .shape = {ROW_COUNT, COLUMNS}};
+        h3_gpu_tensor *loaded = h3_lora_load_target(&target, gpu, &header, &base,
+                                                   error, sizeof(error));
+        require(loaded != NULL, error);
+        require(format ? h3_gpu_tensor_read_f32(loaded, actual, elements) :
+                         h3_gpu_tensor_read_bf16(loaded, actual, elements),
+                "parallel merged readback");
+        require(!memcmp(expected, actual, elements * item),
+                "parallel rows match serial rank-panel arithmetic for all bytes");
+        h3_gpu_tensor_free(loaded);
+        stream = fopen(path, "wb");
+        require(stream && !fclose(stream), "truncate parallel source");
+        loaded = h3_lora_load_target(&target, gpu, &header, &base, error, sizeof(error));
+        require(loaded == NULL, "parallel read failure joins before returning no tensor");
+        free(expected); free(actual);
+    }
+    for (size_t f = 0; f < FACTORS; f++) { free(a[f]); free(b[f]); }
+    require(!unlink(path), "parallel loader cleanup");
+}
+
 static void stack_and_metal(void) {
     char dir[] = "/tmp/h3-lora-test-XXXXXX";
     require(mkdtemp(dir) != NULL, "temporary directory");
@@ -474,6 +554,7 @@ static void stack_and_metal(void) {
         require(fabsf(projected[i] - 15) < 1e-5f,
                 "Metal adapted projection scalar oracle");
     quantization(gpu);
+    parallel_loader(gpu);
     h3_gpu_tensor_free(x);
     h3_gpu_tensor_free(y);
     h3_gpu_tensor_free(w);

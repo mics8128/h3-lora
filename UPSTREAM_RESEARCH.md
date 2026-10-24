@@ -84,3 +84,82 @@ comparison. Keeping that baseline separate prevents attributing a model,
 precision or cache change to a Turbo adapter. Any future port requires a
 specific reproducer or paired benchmark, license review, attribution and
 verification on the execution machine.
+
+## 2026-10-24 follow-up: current optimized fork
+
+The inventory above describes the original upstream comparison. This section
+rechecks actual PR diffs against the now-optimized local fork. No PR75/73/78
+patch was applied or benchmarked locally in this review. Author measurements
+below are not this Mac's results or additive to our measured 6.86% cold-wall
+reduction; current implementation measurements are in
+[COMFY_CACHE_RESEARCH.md](COMFY_CACHE_RESEARCH.md#最終同機量測與交付).
+
+| PR / pinned head | Current finding | Decision |
+|---|---|---|
+| [75: lazy direct Metal pipelines](https://github.com/antirez/h3.c/pull/75), `30b63b51404cae1f2dcc1841abea96f1893c5b49` | Local direct pipelines remain eager. The PR keeps shader-library compilation eager, but creates named pipelines on first use and caches successes per GPU context. Custom encoders bypass generic dispatch helpers but still use the central pipeline getter; MPSGraph caches are separate. | First candidate for a no-precision-change startup optimization; not yet ported. Modify the central getter, preserve context ownership, compare full decoded RGB/PCM and complete single-shot wall. |
+| [73: VAE low precision/cache/prefetch](https://github.com/antirez/h3.c/pull/73), `aac7b5ab1b920ede22c7ce55e6139d11bde06173` | Native local decoder is still F32. Author's fixed-latent M5 Max **64GB**, 768x448/124f replay: F32 43.3s, BF16 13.2s/75.3dB, int8 10.5s/51.6dB. These are decoder-only measurements, not our 1344x768/39f end-to-end workload. | Highest-potential decoder candidate, but a precision tradeoff. Evaluate BF16 independently, keeping F32 default; do not import int8/disk cache/prefetch as one bundle. |
+| [78: stable tile band](https://github.com/antirez/h3.c/pull/78), `c1459cc89c91fe74d2c9a036bc3e1efbae1c5339` | Auto candidates become 256/272/288/304 instead of also considering320. Author reports about34% less temporal flicker for304 vs320, but **+8% modeled decode cost** and a73f/50step example52→55min. | Quality investigation, not a speedup. Do not change tile and precision simultaneously; local auto maximum remains320. |
+| [68: retain VAE across input changes](https://github.com/antirez/h3.c/pull/68), `38ccf9b2e17108c09f8b7dd75dc2327a3a3605e4` | Its objective is already covered by local resident/request separation and removal of reference-change eager clears. Local code additionally retains compatible DiT weights. | Do not copy its unconditional DiT invalidation on input changes; it would lose current reuse. |
+| [63: causal-GQA scratch barrier](https://github.com/antirez/h3.c/pull/63), `1b5afccec7524c8806597d0837a9aa125995e90b` | Same max→sum scratch reuse barrier is now present locally, independently exercised by the multi-SIMD numerical oracle. Local visual-encoder GroupNorm also has the corresponding mean→variance barrier. | Correctness fix already covered, not a new speed claim. Keep synchronization. |
+| [55: int8 weight-cache streaming](https://github.com/antirez/h3.c/pull/55), `8b51e19b9b88ce09e670039aebf8b7e98697e785` | Disk cache contains prequantized QKV/out/MLP weights, not attention results. Fingerprint does not bind dynamic LoRA order/strength/composition; a model fingerprint mismatch only warns. | Not a default128GB resident-speed strategy. Adapted weights must never be bypassed by a base-only cache. |
+
+### PR75: evidence and integration constraints
+
+The author's installed-deployment study reports three fresh-process samples per
+cohort: baseline median58.079s, candidate49.951s, unchanged control57.821s,
+with matching decoded RGB/PCM hashes. It used an M5 Ultra,864x480/56f,
+8Euler steps and shared parser/compact-QKV changes; it was **not an inference
+benchmark of the submitted upstream branch**. Candidate timings varied from
+49.123 to57.443s; fresh process does not prove cold OS/Metal caches. The linked
+commit-pinned evidence extraction returned404 through both raw and blob URLs
+in this review, so only the PR's preserved statements were readable. Do not
+quote its roughly14% improvement as independently verified or portable here.
+[PR body](https://api.github.com/repos/antirez/h3.c/pulls/75),
+[actual diff](https://github.com/antirez/h3.c/pull/75/files).
+
+Lazy creation shifts failures from context creation to first operation. The
+getter retains compiler details, but some existing callers overwrite those
+with generic dispatch-capacity errors; the PR does not repair all diagnostics.
+It adds no thread-safety contract. Current GCD LoRA workers only write
+disjoint preallocated shared-buffer ranges and never compile/encode/submit;
+GPU encoding remains single-owner per context. A residual eager scope remains:
+the int8 MLP caller requests ten pipeline variants before selecting one.
+Do not combine a port with unrelated encoder concurrency or caller refactors.
+
+### PR73: numerical contract and quality boundary
+
+Four large projections lower F32 activations/weights to BF16; matmul output
+rounds to BF16 **before** widening and adding original F32 bias. Retain F32
+residual/norm/RoPE/SwiGLU and small input/output projections. Contrary to its
+stale file-header comment, the PR's low-precision path also uses BF16 SDPA by
+default; keeping SDPA F32 is a distinct variant, not the reported13.2s path.
+Existing generic GPU fallback is not a CPU decoder or automatic recovery to
+F32, and the VAE dimensions do not guarantee use of the handwritten M5 NAX
+projection kernels. [Pinned VAE source](https://github.com/justwjx/h3.c/blob/aac7b5ab1b920ede22c7ce55e6139d11bde06173/h3_video_vae.c),
+[GPU/shader diff](https://github.com/antirez/h3.c/pull/73/files).
+
+Author PSNR uses float RGB in[0,1], not encoded MP4 comparison. BF16 reportedly
+changes7–10% of RGB8 pixels by up to4–6levels: visually similar in the author's
+face/fur crops, **not bit-exact**. Int8 shows faint16px patch structure. High
+PSNR from one latent cannot certify temporal stability or all content. Native
+one-second multi-content visual comparisons, float/RGB8 errors and separate
+longer flicker/seam checks are required before considering a default change.
+
+The approximately4.8GiB disk cache and concurrent decoder prefetch are separate
+startup/I/O/residency mechanisms, unnecessary for testing BF16 arithmetic.
+Prefetch overlaps memory with DiT. Keep these out of a minimal precision port.
+
+### PR78: exact scope
+
+The score remains tile-count×tile-area, not a fixed304px tile for all canvases.
+Explicit `H3_VAE_TILE_PIXELS` still accepts only256..512 in multiples of16:
+the pinned parser cannot choose240 even though the PR discussion includes it.
+The reported34% is a specific high-pass temporal-flicker metric comparison,
+not a guarantee that latent noise or static checkerboards disappear.
+[Pinned tile implementation](https://github.com/bluetorch/h3.c/blob/c1459cc89c91fe74d2c9a036bc3e1efbae1c5339/h3_video_vae.c#L666-L701).
+
+**Chosen sequence, not an implementation claim:** PR75-style lazy pipelines
+first for unchanged arithmetic; BF16-only VAE separately for potential larger
+decode gains with an explicit quality comparison; tile-band changes only as
+a separate quality experiment. Keep existing CLI use and avoid extra cache
+builders, daemon state, low-memory streaming or simultaneous default changes.

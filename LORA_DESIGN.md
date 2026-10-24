@@ -26,16 +26,20 @@ metadata store before Metal work. Missing selected bases fail; base tensor
 payloads remain unloaded until generation. Weight stores
 borrow the context-owned stack and bind only before their first payload load.
 DiT binding precedes token refinement and AdaLN precomputation. Cache clearing
-frees prepared models but retains snapshots. Seed-only reuse avoids remerging;
-prompt/shape/step changes use the same snapshots when rebuilding. Destruction
-frees prepared models before the stack. Replacing source files cannot mutate
+frees prepared models but retains snapshots. Seed-only reuse avoids remerging.
+With session caching enabled, compatible full-core resident weights survive
+prompt/shape/step/reference changes; request text, layout, maps and workspaces are
+rebuilt independently. AdaLN schedules survive only when both sigma clocks and
+condition-modality presence match. Precision/target changes and approximation
+policies retain conservative full invalidation. Destruction frees prepared models
+before the stack. Replacing source files cannot mutate
 an existing context; base files must remain unchanged as in the original loader.
 
 Active-stack SSD streaming is rejected, never silently disabled: its direct
 slot reader otherwise bypasses adapted weight loading. Active adapter targets
-must match request mode. Ref2VA requires a real ordered reference image and
-match sizing; first/last-frame FL2VA is not Ref2VA. No-adapter automatic routing
-is unchanged.
+must match request mode. Ref2VA accepts ordered images, videos, standalone audio,
+and mixtures with match or max image sizing; no dummy image is required for audio.
+First/last-frame FL2VA is not Ref2VA. No-adapter automatic routing is unchanged.
 The CLI, interactive SSD setter, C generation API and internal loader enforce
 these boundaries. `!status` reports the fixed stack; changes require a new
 context. `--info` snapshots active adapter payloads, unlike metadata-only base
@@ -67,15 +71,41 @@ B (flat baked scales 0.125 or 1.0), and the exact normalization declaration
 factor values: baked scaling is never multiplied again. The recognized layout is
 `comfyui_minimax_h3`; unknown baked scaling declarations and simultaneous scalar
 metadata alpha plus baked scaling fail closed.
+Native/Comfy fused-QKV names and controlled Kohya aliases are detected from keys;
+there is no media-specific format selector. True Diffusers/PEFT split-QKV modules
+and `.lora_A.default.weight` / `.lora_B.default.weight` suffixes are not supported.
+Schema/shape validation establishes structural loadability, not which base a
+weight was trained against. Users must select FL2VA- or Ref2VA-trained adapters.
 
-CPU Accelerate SGEMM uses bounded 128-output-row and 64-rank panels. Factors
-remain original dtype; scratch is bounded rather than a full F32 matrix or full
-checkpoint copy. Each element accumulates all contributions in F32, adds the
+Audio-only Ref2VA constructs ordinary `<Audio N>: ` text followed by the prompt
+and uses the existing text-only encoder (sequential Qwen positions, default text
+tags). Audio still enters the real AudioVAE, seeded condition augmentation, and
+packed audio-reference rows. Mixed and visual presentations retain their existing
+vision spans, tags and mRoPE. Source reasoning and the real eight-case smoke matrix
+are recorded in [REF_COMPATIBILITY_RESEARCH.md](REF_COMPATIBILITY_RESEARCH.md).
+
+CPU Accelerate SGEMM uses bounded 128-output-row and 64-rank panels. Large targets
+use at most two synchronous GCD jobs, each with a contiguous set of independent
+128-row tiles, private scratch/base tile/error state, and read-only factors.
+Additional parallel workspace is bounded: the parallel path is selected only when
+the two workspaces together fit 64 MiB; small targets retain serial loading.
+Workers use `pread` and disjoint shared-buffer range writes; all jobs join before
+closing the file, consuming the tensor on GPU, or propagating a read/merge failure.
+No user callback or GPU allocation/submission runs concurrently in these jobs.
+Factors remain original dtype, without a whole-model F32 cache. Each element
+accumulates all contributions in F32, adds the
 base once, then receives one BF16 round-to-nearest/ties-to-even conversion (or
 stays F32). The official base mapping is never mutated. Existing int8 selection
 runs afterward and regenerates scales from adapted weights. No adapter executes
 inside denoising. CLI-order identity is backend-local, not a cross-Accelerate
 version or cross-device inference guarantee.
+Enabled FC1/FC2/QKV/attention-out weight quantizers preserve their kernel order and
+precision, but share one synchronous submission per block. BF16 sources retire
+only after submission completes; diagnostic keep flags remain honored.
+
+The initial A-factor F32 predecode-cache proposal was measured and removed: it
+did not establish a cold wall-time benefit. The actual implementation and media
+equivalence evidence are recorded in [COMFY_CACHE_RESEARCH.md](COMFY_CACHE_RESEARCH.md).
 
 ## Verified source layout
 

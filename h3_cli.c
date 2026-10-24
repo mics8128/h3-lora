@@ -285,7 +285,6 @@ static void clear_references(h3_cli_state *state) {
     for (size_t index = 0; index < state->params.reference_count; index++)
         free_reference(&state->references[index]);
     state->params.reference_count = 0;
-    h3_cache_clear(state->ctx);
 }
 
 static void list_references(const h3_cli_state *state) {
@@ -350,7 +349,6 @@ static void add_reference_image(h3_cli_state *state, char *argument) {
     }
     size_t index = state->params.reference_count++;
     state->references[index] = (h3_reference){H3_REFERENCE_IMAGE, path, NULL, 0};
-    h3_cache_clear(state->ctx);
     printf("Added reference %zu as <Picture %zu>: %s\n",
            index + 1, images + 1, path);
 }
@@ -369,7 +367,6 @@ static void remove_reference(h3_cli_state *state, char *argument) {
     state->params.reference_count--;
     memset(&state->references[state->params.reference_count], 0,
            sizeof(state->references[0]));
-    h3_cache_clear(state->ctx);
     printf("Removed reference %d.\n", number);
     list_references(state);
 }
@@ -385,7 +382,6 @@ static void set_anchor(h3_cli_state *state, int first, char *argument) {
     if (!strcasecmp(argument, "clear")) {
         free(*slot);
         *slot = NULL;
-        h3_cache_clear(state->ctx);
         printf("%s: none\n", name);
         return;
     }
@@ -401,7 +397,6 @@ static void set_anchor(h3_cli_state *state, int first, char *argument) {
     }
     free(*slot);
     *slot = copy;
-    h3_cache_clear(state->ctx);
     printf("%s: %s\n", name, *slot);
 }
 

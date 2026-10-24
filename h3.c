@@ -52,13 +52,17 @@ static void h3_conditioning_cache_clear(h3_ctx *ctx) {
     ctx->conditioning_present = 0;
 }
 
+static void h3_prepared_cache_clear(h3_ctx *ctx) {
+    h3_dit_free(ctx->dit);
+    ctx->dit = NULL;
+    free(ctx->dit_key); ctx->dit_key = NULL;
+    free(ctx->dit_model_key); ctx->dit_model_key = NULL;
+}
+
 void h3_cache_clear(h3_ctx *ctx) {
     if (!ctx) return;
     h3_conditioning_cache_clear(ctx);
-    h3_dit_free(ctx->dit);
-    ctx->dit = NULL;
-    free(ctx->dit_key);
-    ctx->dit_key = NULL;
+    h3_prepared_cache_clear(ctx);
     h3_video_vae_decoder_free(ctx->video_decoder);
     ctx->video_decoder = NULL;
     free(ctx->video_decoder_key);
@@ -210,6 +214,21 @@ static char *h3_prepared_key(const h3_ctx *ctx, const char *conditioning,
         return NULL;
     }
     return key.text;
+}
+
+static char *h3_resident_key(const h3_ctx *ctx, const h3_params *params,
+                             int ref2va) {
+    /* Keep one precision/adapter identity convention. Only request-dependent
+     * fields are normalized; actual sequence-policy compatibility is checked
+     * after the new packed layout has been built. */
+    h3_params resident = *params;
+    resident.frames = 0;
+    resident.steps = 0;
+    resident.sampler = H3_SAMPLER_EULER;
+    resident.scheduler = H3_SCHEDULER_SERVING;
+    resident.video_shift = 12.0f;
+    resident.audio_shift = 3.0f;
+    return h3_prepared_key(ctx, ref2va ? "ref2va" : "fl2va", &resident, 0, 0);
 }
 
 static int h3_text_embedding_copy(h3_text_embedding *destination,
@@ -680,7 +699,7 @@ static int h3_valid_params(h3_ctx *ctx, const h3_params *params) {
         h3_set_error(ctx, "full references cannot be combined with frame anchors");
         return 0;
     }
-    size_t images = 0, videos = 0, audio_inputs = 0, visual = 0;
+    size_t images = 0, videos = 0, audio_inputs = 0;
     for (size_t index = 0; index < params->reference_count; index++) {
         const h3_reference *reference = &params->references[index];
         if (!reference->path || !*reference->path) {
@@ -689,17 +708,17 @@ static int h3_valid_params(h3_ctx *ctx, const h3_params *params) {
         }
         switch (reference->kind) {
         case H3_REFERENCE_IMAGE:
-            images++; visual++;
+            images++;
             break;
         case H3_REFERENCE_VIDEO:
-            videos++; visual++;
+            videos++;
             if (reference->include_embedded_audio) audio_inputs++;
             break;
         case H3_REFERENCE_AUDIO:
             audio_inputs++;
             break;
         case H3_REFERENCE_VIDEO_AUDIO:
-            videos++; visual++; audio_inputs++;
+            videos++; audio_inputs++;
             if (!reference->audio_path || !*reference->audio_path) {
                 h3_set_error(ctx,
                     "video+audio reference %zu has no soundtrack path",
@@ -715,10 +734,6 @@ static int h3_valid_params(h3_ctx *ctx, const h3_params *params) {
     if (images > 9 || videos > 3 || audio_inputs > 3) {
         h3_set_error(ctx,
             "Ref2VA limits are 9 images, 3 videos, and 3 audio inputs");
-        return 0;
-    }
-    if (params->reference_count && !visual) {
-        h3_set_error(ctx, "reference audio requires an image or video reference");
         return 0;
     }
     return 1;
@@ -948,16 +963,6 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
             "active LoRA target must match request mode and cannot use SSD streaming");
         return NULL;
     }
-    if (ctx->loras && ctx->lora_target == H3_LORA_REF2VA) {
-        int image = 0;
-        for (size_t i = 0; i < params->reference_count; i++)
-            image |= params->references[i].kind == H3_REFERENCE_IMAGE &&
-                     params->references[i].path && *params->references[i].path;
-        if (!image || params->reference_image_size != H3_REFERENCE_IMAGE_MATCH) {
-            h3_set_error(ctx, "Ref2VA LoRAs require an actual ordered reference image with match sizing");
-            return NULL;
-        }
-    }
     int render_width = params->render_width ? params->render_width :
                                                params->width;
     int render_height = params->render_height ? params->render_height :
@@ -1017,6 +1022,7 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     h3_result *result = NULL;
     char *conditioning_key = NULL;
     char *prepared_key = NULL;
+    char *resident_key = NULL;
     char *decoder_key = NULL;
     int conditioning_hit = 0;
     int conditioned = 0;
@@ -1049,6 +1055,13 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
         h3_set_error(ctx, "out of memory constructing prepared-model cache key");
         goto cleanup;
     }
+    if (ctx->cache_enabled) {
+        resident_key = h3_resident_key(ctx, params, ref2va);
+        if (!resident_key) {
+            h3_set_error(ctx, "out of memory constructing resident-model cache key");
+            goto cleanup;
+        }
+    }
     h3_key decoder_cache_key = {0};
     if (!h3_key_append(&decoder_cache_key, "%s|%dx%d", vae_path,
                        latent_h, latent_w)) {
@@ -1064,12 +1077,8 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
         ctx->video_decoder_key = NULL;
     }
     if (ctx->cache_enabled && ctx->dit &&
-        (!ctx->dit_key || strcmp(ctx->dit_key, prepared_key))) {
-        h3_dit_free(ctx->dit);
-        ctx->dit = NULL;
-        free(ctx->dit_key);
-        ctx->dit_key = NULL;
-    }
+        (!ctx->dit_model_key || strcmp(ctx->dit_model_key, resident_key)))
+        h3_prepared_cache_clear(ctx);
     conditioning_hit = ctx->cache_enabled && ctx->conditioning_key &&
         !strcmp(ctx->conditioning_key, conditioning_key);
     char detail[512];
@@ -1363,7 +1372,7 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
         }
     }
 
-    if (visual_count) {
+    if (visual_count || ref2va) {
         for (size_t image = 0; image < visual_count; image++) {
             int image_latent_w, image_latent_h;
             h3_latent_canvas(condition_widths[image], condition_heights[image],
@@ -1384,9 +1393,9 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
             h3_set_error(ctx, "condition storage size overflows");
             goto cleanup;
         }
-        condition_video_rows = malloc(condition_video_elements *
-                                      sizeof(*condition_video_rows));
-        if (!condition_video_rows) {
+        condition_video_rows = condition_video_elements ?
+            malloc(condition_video_elements * sizeof(*condition_video_rows)) : NULL;
+        if (condition_video_elements && !condition_video_rows) {
             h3_set_error(ctx, "out of memory allocating visual condition rows");
             goto cleanup;
         }
@@ -1568,6 +1577,10 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     }
     float spatial_rope_scale = !params->use_reference_rope &&
         render_width == 256 && render_height == 256 ? 0.5f : 1.0f;
+    if (ctx->cache_enabled && ctx->dit &&
+        (!ctx->dit_key || strcmp(ctx->dit_key, prepared_key)) &&
+        !h3_dit_can_prepare_request(ctx->dit, &layout))
+        h3_prepared_cache_clear(ctx);
     if (ctx->cache_enabled && ctx->dit && ctx->dit_key &&
         !strcmp(ctx->dit_key, prepared_key)) {
         dit = ctx->dit;
@@ -1580,6 +1593,22 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
             goto cleanup;
         }
         fprintf(stderr, "h3: prepared DiT cache hit\n");
+    } else if (ctx->cache_enabled && ctx->dit) {
+        dit = ctx->dit;
+        dit_is_cached = 1;
+        free(ctx->dit_key); ctx->dit_key = NULL;
+        if (!h3_dit_prepare_request(
+                dit, &text, &layout, &sigmas, spatial_rope_scale,
+                condition_video_rows, condition_video_elements,
+                condition_audio_rows, condition_audio_elements,
+                h3_dit_progress_bridge, &progress, detail, sizeof(detail))) {
+            h3_set_error(ctx, "%s", detail);
+            h3_prepared_cache_clear(ctx);
+            dit = NULL;
+            dit_is_cached = 0;
+            goto cleanup;
+        }
+        fprintf(stderr, "h3: resident DiT weights reused; request re-prepared\n");
     } else if (conditioned) {
         dit = h3_dit_load_conditioned(
             dit_path, ctx->loras, "h3_shaders.metal", &text, &layout, &sigmas,
@@ -1625,15 +1654,25 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
         h3_set_error(ctx, "%s", detail);
         goto cleanup;
     }
-    if (ctx->cache_enabled && !dit_is_cached) {
+    if (ctx->cache_enabled && (!dit_is_cached || !ctx->dit_key)) {
         char *key_copy = strdup(prepared_key);
-        if (!key_copy) {
-            fprintf(stderr, "h3: warning: could not retain prepared DiT key\n");
+        char *model_copy = strdup(resident_key);
+        if (!key_copy || !model_copy) {
+            free(key_copy); free(model_copy);
+            if (dit_is_cached) {
+                ctx->dit = NULL;
+                free(ctx->dit_model_key); ctx->dit_model_key = NULL;
+                dit_is_cached = 0;
+            }
+            fprintf(stderr, "h3: warning: could not retain prepared DiT keys\n");
         } else {
+            free(ctx->dit_key);
+            free(ctx->dit_model_key);
             ctx->dit = dit;
             ctx->dit_key = key_copy;
+            ctx->dit_model_key = model_copy;
             dit_is_cached = 1;
-            fprintf(stderr, "h3: prepared DiT cache miss; model retained\n");
+            fprintf(stderr, "h3: prepared DiT cache updated; model retained\n");
         }
     }
     h3_text_embedding_free(&text);
@@ -1696,6 +1735,8 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
             ctx->dit = NULL;
             free(ctx->dit_key);
             ctx->dit_key = NULL;
+            free(ctx->dit_model_key);
+            ctx->dit_model_key = NULL;
             dit_is_cached = 0;
         }
         goto cleanup;
@@ -1804,6 +1845,7 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
 cleanup:
     free(conditioning_key);
     free(prepared_key);
+    free(resident_key);
     free(decoder_key);
     free(tokenizer_path); free(text_path); free(dit_path); free(vae_path);
     free(audio_vae_path);
