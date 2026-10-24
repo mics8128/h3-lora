@@ -18,6 +18,17 @@ inline ushort h3_f32_to_bf16(float value) {
     return ushort(bits >> 16);
 }
 
+/* Adapted from justwjx/h3.c PR73 (MIT); see VAE attribution. */
+kernel void h3_bias_bf16_to_f32(
+        device const ushort *input [[buffer(0)]],
+        device const float *bias [[buffer(1)]],
+        device float *output [[buffer(2)]],
+        constant uint2 &args [[buffer(3)]],
+        uint index [[thread_position_in_grid]]) {
+    if (index >= args.x * args.y) return;
+    output[index] = h3_bf16_to_f32(input[index]) + bias[index % args.y];
+}
+
 inline float4 h3_bf16x4_to_f32(ushort4 value) {
     return as_type<float4>(uint4(value) << 16);
 }

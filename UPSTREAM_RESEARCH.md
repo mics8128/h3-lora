@@ -1,13 +1,14 @@
 # Upstream PR and fork research
 
-This is a source/evidence review; external patches are not merged here. The
-comparison is against upstream `8974cc055ea9c02fcd14cc27dfda3e1027c05153`.
-The user requested speed optimizations and bug fixes as well as LoRA references.
-Upstream h3.c is MIT; retain original author attribution for any future port.
-Model-weight licensing is separate. Public performance numbers below are the PR
-authors' measurements, not measurements of this fork.
+The original source/evidence inventory compares upstream
+`8974cc055ea9c02fcd14cc27dfda3e1027c05153`. Following explicit user approval,
+selected PR75/PR73 mechanisms were implemented; the dated follow-up below
+records current status. Original inventory decisions are historical, not a
+second implementation backlog. Upstream h3.c is MIT; attribution is retained
+in THIRD_PARTY_NOTICES.md. Model-weight licensing is separate. Author-reported
+numbers are not local measurements unless a section explicitly says so.
 
-## High-value references
+## Original high-value reference inventory
 
 | Source | Mechanism and reported evidence | Decision for this fork |
 |---|---|---|
@@ -87,17 +88,16 @@ verification on the execution machine.
 
 ## 2026-10-24 follow-up: current optimized fork
 
-The inventory above describes the original upstream comparison. This section
-rechecks actual PR diffs against the now-optimized local fork. No PR75/73/78
-patch was applied or benchmarked locally in this review. Author measurements
-below are not this Mac's results or additive to our measured 6.86% cold-wall
-reduction; current implementation measurements are in
-[COMFY_CACHE_RESEARCH.md](COMFY_CACHE_RESEARCH.md#最終同機量測與交付).
+The inventory above describes the original upstream comparison. After the user
+authorized implementation, PR75-style lazy direct pipelines and the BF16-only
+portion of PR73 were ported. PR78 is not applied. Author measurements below
+remain distinct from our local measurements; the current same-machine results
+are recorded in [COMFY_CACHE_RESEARCH.md](COMFY_CACHE_RESEARCH.md).
 
 | PR / pinned head | Current finding | Decision |
 |---|---|---|
-| [75: lazy direct Metal pipelines](https://github.com/antirez/h3.c/pull/75), `30b63b51404cae1f2dcc1841abea96f1893c5b49` | Local direct pipelines remain eager. The PR keeps shader-library compilation eager, but creates named pipelines on first use and caches successes per GPU context. Custom encoders bypass generic dispatch helpers but still use the central pipeline getter; MPSGraph caches are separate. | First candidate for a no-precision-change startup optimization; not yet ported. Modify the central getter, preserve context ownership, compare full decoded RGB/PCM and complete single-shot wall. |
-| [73: VAE low precision/cache/prefetch](https://github.com/antirez/h3.c/pull/73), `aac7b5ab1b920ede22c7ce55e6139d11bde06173` | Native local decoder is still F32. Author's fixed-latent M5 Max **64GB**, 768x448/124f replay: F32 43.3s, BF16 13.2s/75.3dB, int8 10.5s/51.6dB. These are decoder-only measurements, not our 1344x768/39f end-to-end workload. | Highest-potential decoder candidate, but a precision tradeoff. Evaluate BF16 independently, keeping F32 default; do not import int8/disk cache/prefetch as one bundle. |
+| [75: lazy direct Metal pipelines](https://github.com/antirez/h3.c/pull/75), `30b63b51404cae1f2dcc1841abea96f1893c5b49` | Library compilation remains eager; named direct pipelines now build on first use and cache successes per GPU context. All custom direct encoders use the central getter; MPSGraph caches remain separate. | Implemented without arithmetic changes. Paired F32 CLI outputs match complete baseline RGB/PCM hashes. Eager median136.023s vs final lazy136.140s is a noise-scale difference, not confirmation of the author's14% claim. |
+| [73: VAE low precision/cache/prefetch](https://github.com/antirez/h3.c/pull/73), `aac7b5ab1b920ede22c7ce55e6139d11bde06173` | F32 remains default; `H3_VAE_PRECISION=bf16` selects BF16 large projections/SDPA with F32 residual/norm/RoPE/SwiGLU/small projections. | BF16-only implemented; invalid values fail and resident decoder identity includes precision. No int8, disk cache or prefetch. Final39f/768p VAE median40.868→13.909s; complete wall136.140→110.814s (18.60% less). These are our workload, not the author's768x448/124f replay. |
 | [78: stable tile band](https://github.com/antirez/h3.c/pull/78), `c1459cc89c91fe74d2c9a036bc3e1efbae1c5339` | Auto candidates become 256/272/288/304 instead of also considering320. Author reports about34% less temporal flicker for304 vs320, but **+8% modeled decode cost** and a73f/50step example52→55min. | Quality investigation, not a speedup. Do not change tile and precision simultaneously; local auto maximum remains320. |
 | [68: retain VAE across input changes](https://github.com/antirez/h3.c/pull/68), `38ccf9b2e17108c09f8b7dd75dc2327a3a3605e4` | Its objective is already covered by local resident/request separation and removal of reference-change eager clears. Local code additionally retains compatible DiT weights. | Do not copy its unconditional DiT invalidation on input changes; it would lose current reuse. |
 | [63: causal-GQA scratch barrier](https://github.com/antirez/h3.c/pull/63), `1b5afccec7524c8806597d0837a9aa125995e90b` | Same max→sum scratch reuse barrier is now present locally, independently exercised by the multi-SIMD numerical oracle. Local visual-encoder GroupNorm also has the corresponding mean→variance barrier. | Correctness fix already covered, not a new speed claim. Keep synchronization. |
@@ -158,8 +158,8 @@ The reported34% is a specific high-pass temporal-flicker metric comparison,
 not a guarantee that latent noise or static checkerboards disappear.
 [Pinned tile implementation](https://github.com/bluetorch/h3.c/blob/c1459cc89c91fe74d2c9a036bc3e1efbae1c5339/h3_video_vae.c#L666-L701).
 
-**Chosen sequence, not an implementation claim:** PR75-style lazy pipelines
-first for unchanged arithmetic; BF16-only VAE separately for potential larger
-decode gains with an explicit quality comparison; tile-band changes only as
-a separate quality experiment. Keep existing CLI use and avoid extra cache
-builders, daemon state, low-memory streaming or simultaneous default changes.
+**Implementation boundary:** lazy direct pipelines and BF16-only VAE are now
+implemented; F32 remains default. Tile-band changes remain a separate quality
+proposal. Existing CLI use is preserved: no cache builders, daemon state,
+low-memory streaming or simultaneous tile/default-precision changes. See
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for source attribution.

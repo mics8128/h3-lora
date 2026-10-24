@@ -1062,9 +1062,15 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
             goto cleanup;
         }
     }
+    const char *vae_precision = getenv("H3_VAE_PRECISION");
+    if (!vae_precision) vae_precision = "f32";
+    if (strcmp(vae_precision, "f32") && strcmp(vae_precision, "bf16")) {
+        h3_set_error(ctx, "H3_VAE_PRECISION must be f32 or bf16");
+        goto cleanup;
+    }
     h3_key decoder_cache_key = {0};
-    if (!h3_key_append(&decoder_cache_key, "%s|%dx%d", vae_path,
-                       latent_h, latent_w)) {
+    if (!h3_key_append(&decoder_cache_key, "%s|%dx%d|%s", vae_path,
+                       latent_h, latent_w, vae_precision)) {
         h3_set_error(ctx, "out of memory constructing decoder cache key");
         goto cleanup;
     }

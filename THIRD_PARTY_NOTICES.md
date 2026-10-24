@@ -30,3 +30,17 @@ SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
 CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
 OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+## h3.c optimization references (MIT)
+
+The on-demand direct Metal pipeline cache is adapted from jerryfane's
+[PR75](https://github.com/antirez/h3.c/pull/75), pinned at
+`30b63b51404cae1f2dcc1841abea96f1893c5b49`.
+The optional BF16 video VAE projections, attention and typed bias-widening
+operation are adapted from justwjx's
+[PR73](https://github.com/antirez/h3.c/pull/73), pinned at
+`aac7b5ab1b920ede22c7ce55e6139d11bde06173`.
+Both source trees carry the MIT license, Copyright (c) 2026 Salvatore
+Sanfilippo; the complete permission and warranty notice is retained in
+[LICENSE](LICENSE). Model-weight licenses are separate; these code references
+do not grant rights to H3 or LightVAE weights.

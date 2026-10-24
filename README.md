@@ -568,6 +568,11 @@ maximum or mean. These checks caught and now guard the Qwen causal-GQA and visua
 encoder GroupNorm synchronization races; this is a correctness fix, not a lossy
 speed mode.
 
+Fixture-free `h3_vae_precision_tests` is also included in `make test`. Literal
+BF16 inputs and small F32 biases verify widening-before-bias, row broadcast
+and preservation of F32 output precision; dtype, capacity and dispatch-size
+boundaries reject invalid requests. It does not require downloaded fixtures.
+
 Real-model cache regression is opt-in:
 
 ```sh
@@ -695,6 +700,30 @@ The video VAE automatically chooses a 256-320 pixel spatial tile from the
 requested canvas geometry, minimizing repeated overlap work while keeping peak
 storage bounded. `H3_VAE_TILE_PIXELS=256` restores the original conservative
 tile plan for close-reference diagnosis.
+
+The native video decoder defaults to F32. To opt into BF16 large projections
+and BF16 attention without changing the model, sampler, steps or canvas:
+
+```sh
+H3_VAE_PRECISION=bf16 ./h3 -d ./MiniMax-H3 -p "A red fox walks in snow." -o outputs/fox.mp4
+```
+
+Only `f32` and `bf16` are accepted; unset means `f32`, while empty or other
+values fail explicitly. Norms, RoPE, SwiGLU, residuals, small projections and
+the audio VAE remain F32. Projection results round to BF16 before widening
+and adding F32 bias, so this is **not bit-exact** with F32. Resident decoder
+identity includes precision; changing it does not invalidate compatible DiT
+weights. No additional weights, cache builder, daemon, int8 VAE or background
+prefetch are required. LightVAE is a separate pruned-model proposal, **not**
+implemented by this precision option; see [the assessment](COMFY_CACHE_RESEARCH.md#lightvae-是否值得做成選項).
+
+Direct Metal pipelines are now built on first operation use and retained per
+GPU context, following [upstream PR75](https://github.com/antirez/h3.c/pull/75).
+Shader-library compilation remains eager. An unused kernel no longer blocks
+context creation; a required kernel that cannot compile fails its operation.
+This does not change arithmetic or make a GPU context thread-safe. BF16 VAE
+arithmetic follows [PR73](https://github.com/antirez/h3.c/pull/73), without its
+disk cache, prefetch or int8 modes.
 
 ### Weight residency and streamed prompt encoding
 

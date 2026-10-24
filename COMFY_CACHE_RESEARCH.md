@@ -114,3 +114,48 @@ Apple M5 Max128GiB；四次交錯順序為舊→新→新→舊，各次獨立�
 **真實互動CLI**也實跑：Ref2VA初次62.30秒、加第二張商品圖26.27秒、移除後19.54秒、明確clear後60.70秒。加圖與移除均重用core；移除及clear後原設定的RGB/PCM與第一支一致，雙圖的輸出確有改變。這個smoke使用8步Ref2VA adapter；數值cache矩陣的5步是等價性測試，不是該權重的正式品質建議。
 
 **本機交付**：`/Users/mics/Movies/H3-Optimization-20261024/`。188個遠端記錄檔案已逐一核對SHA-256；包含117支原片／預覽（保留探索過程與失敗證據，不能把舊失敗目錄當成最終版），所有117支在這台Mac完整影音解碼成功。最終以 `final-verification.json` 的 `all_success=true`、`fixed-cache-*`、`*-corrected-cold-*`、`fixed-final-resident` 和 `interactive-ref-edit` 為準；`FINAL-QUALITY-OVERVIEW.jpg`為抽樣畫面總覽。未作主觀音訊、唇形同步或長片品質評分。
+
+## LightVAE 是否值得做成選項
+
+**值得做獨立、明確選用的草稿 decoder，但不作預設，也不在這輪 BF16 移植時混入。**標準 H3 Lite 是 block pruning：原36層保留12層 `[1,3,6,9,13,16,18,21,26,27,30,34]`，不是將36層任意減成前12層。[官方 config](https://github.com/ModelTC/LightVAE/blob/main/lightvae/config/h3-lightvae.json) 保留24channel latent interface、normalization、tile256/overlap64及各架構參數；原生 loader 必須驗證實際checkpoint key/index remapping，不能把缺層當成零權重或直接換檔名。
+
+[官方模型庫](https://huggingface.co/lightx2v/LightVAE/tree/main)列出標準 Lite decoder約3.25GB、encoder約406MB，另有約834MB的ConvRot-INT8 decoder。第一個有意義的選項應只替換**標準 Lite decoder**，沿用原始encoder與audio VAE。[官方 ComfyUI 整合](https://github.com/ModelTC/LightVAE/blob/main/comfyui/README.md)要求FL2V首尾幀條件仍用原始encoder；Ref2V可分別替換encoder/decoder，但本專案不因此擴大到encoder替換。ConvRot-INT8是不同checkpoint及運算契約，不等同於現有Metal int8 primitive，本輪不移植。
+
+[官方專案](https://github.com/ModelTC/LightVAE)報H3解碼最高2.97×及原始overall VBench-2.0分數99.51%，測量背景是H200，不是M5，也不是端到端生成倍數。**[INFERENCE]** 只有decoder佔用時間能被這項改動縮短，DiT去噪、文字編碼及LoRA載入仍存在；即使解碼快三倍，也不能宣稱影片生成快三倍。BF16和裁層是正交取捨，應先比較完整F32 vs Lite-F32，再比較各自BF16，不能將兩項差異歸因給一項。
+
+落地前置條件：固定權重revision與SHA256、確認原始block index／緊密重編index、dtype與normalization一致、所有tensor shapes匹配，並驗證單tile／空間接縫／時間chunk重疊／resident preview及FL2VA/Ref2VA。模型庫的Apache-2.0標籤不應被解讀為覆蓋H3衍生權重的所有限制；採用及再散布前須另查[H3 Community License](https://huggingface.co/MiniMaxAI/MiniMax-H3/blob/main/LICENSE)及適用地區／用途。沒有把模型權重納入git或自動下載。
+
+本輪結論是**列為下一個草稿選項候選**，不是已實作LightVAE；沒有本機LightVAE速度／畫質證據。原始完整decoder繼續作正式品質基準，BF16選項不需要LightVAE權重。
+
+## PR75／PR73 移植後的最終量測
+
+已實作PR75式per-GPU-context lazy direct pipeline；library仍啟動時編譯，不改shader算術或thread-safety契約。已獨立移植PR73的BF16大型projection／SDPA，保留F32預設與F32norm／RoPE／SwiGLU／residual／小投影。`H3_VAE_PRECISION=bf16`明確選用；只接受`f32`／`bf16`，未設等同`f32`，空值／其他值直接錯誤。decoder key加入有效precision，故precision切換只重建decoder而不重載相容DiT。BF16模式不配置用不到的F32attention-output scratch。沒有移植disk cache／prefetch／int8 VAE，也沒有變更tile範圍或引入LightVAE權重。
+
+### 同一最終executable、同prompt／seed、1344×768／39幀
+
+M5 Max128GiB，Lightx v1.2強度1、RES/simple5步、50層、reuse/core-reuse1；完整推論含載入與原片輸出，不含一秒剪輯／傳輸。最終順序F32→BF16→BF16→F32，各2次新process，沒有清OS／Metal caches，沒有聲稱整機獨占。39幀是1.625秒；另提供一秒預覽，不能把整體時間當作只生成24幀。
+
+| 指標 | 最終F32 | 最終BF16 |
+|---|---:|---:|
+| 完整wall第1次 | 138.685秒 | 114.170秒 |
+| 完整wall第2次 | 133.596秒 | 107.458秒 |
+| 完整wall中位數 | 136.140秒 | 110.814秒 |
+| video VAE profile中位數 | 40.868秒 | 13.909秒 |
+| process peak physical footprint範圍 | 25.165GB | 25.165–25.933GB |
+
+這組完整wall少**18.60%／25.327秒**，VAE階段約**2.94×**。最小32×32／5幀的direct decoder smoke則F32約1.09秒、BF16約1.33秒，**小畫布不保證變快**；不要以大型畫布收益外推所有情況。
+
+PR75獨立比較的已發布eager基線兩次137.587／134.460秒，中位數136.023秒；最終lazy F32中位數136.140秒，差約0.117秒，屬本次波動尺度，**沒有重現作者約14%的收益**。先前lazy F32樣本中位數135.667秒亦只差0.356秒。保留lazy機制是為避免未用pipeline建置及刪除固定kernel清單，不宣稱本機顯著加速。最終四次F32／BF16及基線的音訊PCM全相同；F32完整decodedRGB與基線相同，BF16兩次完整decodedRGB相同但不等於F32。
+
+### 品質與實際接線驗證
+
+- 公園人物、雪地狐狸各一組768p／39幀F32/BF16原片，附左右一秒比較；抽樣檢視composition與主體接近，沒有宣稱長片品質／唇形／所有紋理無損。公園初次對照與最終對應precision的完整RGB/PCM雜湊相同；狐狸只有初次一組對照。
+- 完整解碼H.264RGB8比較PSNR：人物37.200dB、狐狸41.179dB；最大channel差51／52levels。**包含codec效應，不是decoder floatPSNR**，不能拿它和PR73作者的float75.3dB直接比較或宣稱最大只差4–6levels。
+- 另用固定**合成latent**直接比較未編碼floatRGB：32×32／5幀63.644dB、最大0.003001；352×256／39幀62.238dB、最大0.029974。這不是語意／人物品質樣本，也沒有重現作者75.3dB。352寬確實跨空間tile，39幀跨時間chunk。
+- F32與BF16各自驗證ordinary chunked／resident final完整floatRGB byte-identical；resident preview與ordinary對應中間幀byte-identical。也實跑32×32／5幀direct diagnostic入口，並非只測CLI的單一路徑。
+- 真實FL2VA及Ref2VA圖片＋音訊context各跑F32→BF16→F32→unset。只初次load core一次，後續全部0次；回F32／unset的完整callbackRGB雜湊與第一支一致，BF16不同，排除沿用錯precision decoder。Ref2VA使用8步相符adapter；這個256平方smoke驗接線，不當作768p品質基準。空值與`int8`precision均實際拒絕。
+- fixture-free `h3_vae_precision_tests`納入`make test`，獨立literal oracle驗BF16 widening後加F32bias、row broadcast、dtype／容量／overflow邊界。最終build無警告，該測試、host1768checks、LoRA numeric/snapshot/Metal、sampler、多SIMD reduction檢查全通過；沒有宣稱執行缺少fixtures的整套MLXparity。
+
+### 成品與重現
+
+本機`/Users/mics/Movies/H3-Lazy-BF16-20261024/`。最終驗收看`final/verification.json`的`all_success=true`、`final/summary.json`及兩個resident目錄的smoke.log。根目錄summary／原片是初次完整人物／狐狸對照，`final/`是去除unused scratch後的最終binary重複量測；保留兩者，不混淆binarySHA。`park-f32-left-bf16-right-1s.mp4`、`fox-f32-left-bf16-right-1s.mp4`與`F32-vs-BF16-QUALITY.jpg`可直接觀看。沒有將影片、模型或本機benchmark harness提交到git；原始driver作成品重現附件。
