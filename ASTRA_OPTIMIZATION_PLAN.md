@@ -1,4 +1,6 @@
-# Astra 建議：先加速真正的冷啟動，再讓不變權重跨任務常駐
+# Astra 建議與實作裁定紀錄
+
+> 前段保留歷史提案，部分方案經量測調整或未採用，不是當前待辦清單；末段為2026-10-25工具核查後的建議。使用者已決定暫時收案，等實際流程回饋再重開，不主動執行後續候選。日常用法見[README](README.md)，實作與量測見[COMFY_CACHE_RESEARCH](COMFY_CACHE_RESEARCH.md)。下文「本輪／當前」依各次提案當時的快照解讀。
 
 **建議本輪實作兩項主改動、一項量測後決定的改動：**
 
@@ -308,3 +310,40 @@ LightVAE Lite最值得作為下一個明確加速候選：少做decoder blocks�
 - 修正後同一conditioning probe的fresh／clear／shape／back五次text/video/audio bytes一致。這是正確性修正，不是為了加速降低精度；不同於錯誤kernel的舊結果不應被當成品質退步或靠寬鬆SSIM掩蓋。
 
 正式冷／暖數字、完整fresh-versus-warm矩陣與交付證據集中在 [COMFY_CACHE_RESEARCH.md](COMFY_CACHE_RESEARCH.md)，避免把提案中的假設寫成已量測收益。LightVAE／BF16或INT8 VAE、CUDA稀疏注意力與持久化disk cache均未混入本次預設。
+
+## 2026-10-25：綜合應用與下一階段建議（Astra唯讀核查）
+
+使用者要求：「並且效能優秀? 還有明顯的優化空間嗎? 專案整理下 你提的幾個已經算是進階應用?」「就是指綜合應用 實際上用指令分開執行也是可行的吧?」，並指定交給Astra提出建議。第一輪先將原話、實作狀態、精確效能與模型清理界線交給**實際`llm-esapp/gpt-6-astra`**；收到回覆後，依使用者補充再開放read／grep／glob／web_search做第二輪唯讀核查。第二輪完成65次唯讀工具呼叫，沒有改runtime、下載權重、build、tests、SSH或新增推論。下列是諮詢建議，**不是已完成的新功能／benchmark，也不自動授權實作**。
+
+完整brief與兩輪原文在本機`/Users/mics/Movies/H3-Astra-Review-20261025/`：`request.md`、`01-initial-advice.md`、`02-investigation-request.md`、`03-investigated-advice.md`；`consultation-verification.json`記錄實際model與唯讀呼叫。第二輪CLI外層回傳1／yielded，但確實收到完整final assistant文字且model=`gpt-6-astra`、stopReason=`stop`；不將該CLI退出碼當作模型測試通過。
+
+### 結論與對原排序的修正
+
+**常見綜合用途已可用CLI分步完成；不必重建ComfyUI。** 批次挑片、多參考、分鏡剪接、外部字幕混音放大是編排，不應當成引擎缺少進階功能。獨立process仍重付cold成本；同模型／adapter反覆試片應使用現有互動context。mask／ControlNet／任意時間guide／latent import-export／partial denoise是另一類生成原語，多次重新生成不能等價補上。
+
+優先順序由原先「常駐→pruned→DiT→Lite」修正為：**先以最新正式設定補warm做片證據→定位DiT瓶頸→針對pruned作有限相容性研究**。既有常駐現在就能用，不是新開發案。encoder小格式及LightVAE暫緩，除非新觀察顯示容量／I/O／decoder佔比確實值得優先處理。不再下載或刪除模型，也不清理Time Machine snapshots。
+
+### 工具核查揭露的關鍵界線
+
+1. **profile不能把wait當浪費、root-gpu當完整GPU時間。** `h3_gpu.h`／`h3_gpu.m`的root timestamp不涵蓋全部MPS child工作；direct int8 matmul不計入MPS linear次數，故`linear=0`不是沒有矩陣運算。`h3_gpu_profile_mark`的wall是兩次mark間隔，warm時可能夾入上一輪decode／輸出／使用者等待；後續驗收應量逐次`h3_generate`及正確phase邊界，不能直接挪用context lifetime total。
+2. **已有bench，不先造平台。** `tests/bench_dit.c`及`h3_dit_bench`已有QKV／MLP／command等診斷，但固定fixture／shape／20步不等同最新768p／39f／RES-simple5 workload。先以代表性warm請求定位，必要時才做局部GPU timeline，不把強制fence擾動當正常成本。
+3. **pruned不是綁固定步數的表。** [Comfy模型](https://github.com/Comfy-Org/ComfyUI/blob/master/comfy/ldm/minimax/model.py#L642-L729)以`t=1-sigma`映射`adaln_t_table`，在相鄰格點作線性插值；不是按第幾步查表。因此改steps／shift／simple本身不構成已證實的不相容。所選官方artifact的metadata／basis／數值誤差仍未核查，不能保證無損或速度。
+4. **LoRA按target分類，不籠統否決。** `h3_lora.c`確實接受block/final AdaLN與time-embedder更新。只改未縮維attention／MLP等target的LoRA，沒有必然重建時間表的結構理由；改原始2688-wide AdaLN需相符basis與constant/bias轉換，改time embedder則原表失效。現行8-wide pruned-trained AdaLN另屬新增契約。任何不相容必須明確拒絕，不能仿效警告後跳過來假稱成功。[上游模型偵測](https://github.com/Comfy-Org/ComfyUI/blob/master/comfy/model_detection.py)、[官方格式說明](https://docs.comfy.org/tutorials/video/minimax/minimax-h3)。
+5. **encoder不是整份常駐GPU，pruned不等比例減warm RAM。** `h3_text_encoder.c`逐層讀取、釋放，保留的是conditioning；約4.5秒profile含GPU建立／載入／計算等，非純計算，也不含所有tokenizer／weight-store開啟成本。`h3_dit_schedule.c`原本已在prepare時計算AdaLN並逐block釋放大projection，所以少約26GBcheckpoint不能直接推算warm RAM同少26GB或每步同樣加速。
+6. **LightVAE上限要看場景。** 完全消除13.9秒VAE最多約12.6%的說法只適用110.8秒cold-process樣本；warm分母與decoder load不同，須重新量測，不能拿它普遍否決Lite。
+
+### 最多三項下一步（建議，未執行）
+
+| 項目 | 最小範圍與驗收 | 停止門檻 |
+|---|---|---|
+| 最新正式warm做片驗收 | 同768p／39f／v1.2／BF16 context依序first、換seed、改prompt、改steps、回設定；記逐請求wall／core reload／conditioning／decoder／footprint。另選一個真實Ref2VA圖片＋音訊用途和一段目標片長，例如124f，完整看片聽音，不只解碼／hash | 用法、重載與品質問題足夠清楚即停，不擴全矩陣／daemon |
+| DiT熱點定位 | 利用既有profile／bench測假說；必要時一個代表性warm forward的完整GPU timeline，區分SDPA、projection、MLP、搬移與提交空檔 | 沒有穩定熱點，或只有microbenchmark／dispatch數量／root timestamp優勢，就不落地kernel改動 |
+| pruned BF16 target-aware研究 | 固定兩個task artifact，核對header/config/table及實際adapter是否更新時間支路；列支援／拒絕／未知，再決定數值探針。分開量磁碟、cold、warm reprepare、RAM | 為主要已接受targets需完整原模型或大量專用轉換且只剩不急的磁碟收益，就不升級為優先實作 |
+
+Astra另指出兩個文件使用陷阱：Ref2VA immutable target刪完最後reference後，無reference request會轉FL2VA而產生target衝突；互動入口另建`/tmp/h3-XXXXXX`並清除原`output_path`，不能以原單次`-o`猜輸出位置。更換adapter／strength需新context。這些應作現有契約提醒，不當作缺少生成模式。
+
+**本輪決定僅保存建議與證據；沒有執行上述warm／長片驗收、沒有改profile或導入pruned loader。** 日常定位仍是Mac原生主要H3生成引擎，沒有同條件ComfyUI對照，不宣稱效能冠軍或工作流等價。
+
+## 收案決定
+
+使用者於本輪同意暫時收案，先整理文件並commit／push，等待實際製作流程回饋。上列warm／長片驗收、DiT profile及pruned研究均是重開時的候選，不是現在排程。已有runtime與模型保留集合維持不變；不新增功能、不下載權重、不延伸刪除或清理APFS快照。

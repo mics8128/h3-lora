@@ -1,5 +1,7 @@
 # ComfyUI 如何減少 H3 重複載入成本
 
+> 本文件依序保留來源研究、常駐優化、BF16移植與實測；前段的程式狀態是當時快照。最新已落地結果見[PR75／PR73最終量測](#pr75pr73-移植後的最終量測)，日常操作見[README](README.md)。LightVAE仍只有評估，BF16已是可選功能。
+
 ## 範圍與可重現來源
 
 2026-10-24 透過 [GitHub commits API](https://api.github.com/repos/Comfy-Org/ComfyUI/commits/7cebca52227c63b4180ceed448cbd7ad22903b6d) 固定 Comfy-Org/ComfyUI **`7cebca52227c63b4180ceed448cbd7ad22903b6d`**（commit 時間 2026-10-24T02:22:35Z）。以下為官方程式碼閱讀，不是 Mac 上的 ComfyUI/H3 效能測試；沒有執行 inference、build 或 tests。自訂節點可能有自己的 `IS_CHANGED`、輸入依賴與載入策略，不能直接套用標準節點結論。
@@ -159,3 +161,22 @@ PR75獨立比較的已發布eager基線兩次137.587／134.460秒，中位數136
 ### 成品與重現
 
 本機`/Users/mics/Movies/H3-Lazy-BF16-20261024/`。最終驗收看`final/verification.json`的`all_success=true`、`final/summary.json`及兩個resident目錄的smoke.log。根目錄summary／原片是初次完整人物／狐狸對照，`final/`是去除unused scratch後的最終binary重複量測；保留兩者，不混淆binarySHA。`park-f32-left-bf16-right-1s.mp4`、`fox-f32-left-bf16-right-1s.mp4`與`F32-vs-BF16-QUALITY.jpg`可直接觀看。沒有將影片、模型或本機benchmark harness提交到git；原始driver作成品重現附件。
+
+## 效能判斷與剩餘優化空間
+
+「有實際優化且本機可用」已有證據；「優於同機ComfyUI／其他Mac引擎」尚無同條件對照，不能用各自不同模型、精度、幀數的數字排名。最新final/summary.json的BF16兩次短測（114.170／107.458秒）只是1344×768、39幀、單prompt、單seed、Lightx v1.2五步；不代表5–15秒、多參考或所有題材速度。
+
+| BF16 phase | 第1次 | 第2次 | 中位數 |
+|---|---:|---:|---:|
+| Qwen編碼 | 4.446秒 | 4.557秒 | 4.502秒 |
+| DiT load／prepare | 36.681秒 | 36.229秒 | 36.455秒 |
+| DiT denoise | 55.923秒 | 50.385秒 | 53.154秒 |
+| video VAE | 14.339秒 | 13.479秒 | 13.909秒 |
+
+準備階段包含讀檔、LoRA合併、量化、預計算，不等於純SSD時間；各phase中位數不可當作能精確相加的整體breakdown。原生runtime已選擇較快的硬體kernel，但不能據此推論沒有更多kernel機會。
+
+**收案裁定（2026-10-25）**：功能暫停擴充，先進實際流程，不主動啟動新驗收或優化。若之後有具體問題，依[Astra唯讀複核](ASTRA_OPTIMIZATION_PLAN.md#2026-10-25綜合應用與下一階段建議astra唯讀核查)先看最新warm／品質證據，再定位DiT，pruned只作target-aware相容性研究。既有常駐現在就能用；encoder小格式、LightVAE、量化及sparse均暫緩，沒有新增空選項或服務框架。
+
+LightVAE不是消失的價值，而是收益必須依場景判斷：**[INFERENCE]** 若完全消除本次cold-process約13.9秒VAE，相對約110.8秒整體最多約12.6%（忽略其他成本變動），實際Lite仍需decode/load。這只限該cold樣本，不是Litebenchmark或承諾，不能外推warm占比或用來普遍否決Lite；若實際流程顯示decoder／容量問題再評估。
+
+一般「分鏡生成→挑片→剪接／混音／字幕／外部放大」可用多個CLI與外部工具串接，並非本引擎缺乏生成模式。多參考也可在同次Ref2VA輸入，不必分成多次。真正需要新增原語的是任意時間guide、latent mask、ControlNet、latent輸出／輸入及partial-denoise續接；逐次重新生成或像素放大不能冒稱這些功能。詳細定位在[README](README.md#5-綜合應用先用指令串接不必重建節點系統)。

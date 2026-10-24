@@ -48,7 +48,7 @@
 
 [5] [本地比較規範](COMPARISON.md) 與 [2026-10-23 inventory](tools/turbo_models.json)：保留選定參數及權重 hash；若往後 API 不可用，應明示引用的是 **2026-10-23 快照**，不是當日完整 inventory。本次未重新擷取完整可持久化 API 快照。
 
-[6] [本地 README：Turbo sampler selection／speed-quality preset](README.md)：simple、reuse、row-fc2 與 SSD 限制。歷史量測是文件紀錄，並非本研究重測結果。
+[6] [本地 runtime reference：Turbo sampler selection／speed-quality preset](RUNTIME_REFERENCE.md)：simple、reuse、row-fc2 與 SSD 限制。歷史量測是文件紀錄，並非本研究重測結果。
 
 ## 本次一秒交付實測
 
