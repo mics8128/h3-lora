@@ -99,6 +99,16 @@ H3_VAE_PRECISION=f32 ./h3 -d "$REF_MODEL_DIR" \
 
 FL2VA Turbo不能拿來替代Ref2VA Turbo。`--first-frame/--last-frame`是FL2VA首尾幀條件，不是一般Ref2VA參考，兩組入口不能混用。純音訊及混合參考已有實際接線，但不保證音色、節奏、唇形或人物一致性；影片原聲是conditioning，不是原樣拷貝至輸出。[完整參考入口與限制](RUNTIME_REFERENCE.md#8-add-image-video-and-audio-references)。
 
+### 2026-10-26：main 整合與 128G 核對
+
+- 本機將 `feature/turbo-comparison` 快轉整合至 `main`，功能基準為 `7f87de2`；未改動生成程式。
+- 128G（`ted`）部署目錄 `/Users/tedmacbookpro/projects/h3-lora` 的 87 個受版控檔案，逐檔 SHA-256 與此功能基準一致。遠端 Git 仍是 upstream `8974cc0` 加未提交部署檔，**檔案一致不代表遠端 Git 已同步 main**；本次未切換分支、覆蓋檔案或重啟工作。
+- 遠端 `make -q h3` 回傳 0，表示依現有 Makefile 與檔案時間無待重建項目；這不是執行檔可重現建置的雜湊證明。
+- 在遠端以既有 Ref2VA root，同時傳入 `--ref-image`、`--ref-audio`、`--first-frame`，512×512／22幀／2步，實際 CLI 回傳 exit 1：`h3: full references cannot be combined with frame anchors`。請求在參數驗證階段拒絕，未生成影片。
+- **目前不能以「參考圖＋參考聲音＋指定首圖」三項同時產片。** 圖＋音可走 Ref2VA（既有短片接線證據見 [相容性研究](REF_COMPATIBILITY_RESEARCH.md) 的實跑驗收段落）；首圖條件走 FL2VA，不能再混入 Ref2VA 圖／音。把首圖改為另一張 `--ref-image` 只是軟參考，不等於首幀錨定；聲音參考也不保證原音照搬、音色或唇形。
+- 核對當下遠端有 video-maker 的 Ref2VA 圖／音工作執行中；未中斷、未另啟完整推論。本次驗證的是三項組合確實被拒絕，不是重新驗收圖／音生成品質。
+
+
 ## 3. 連續改prompt：用互動常駐
 
 在對應命令中省略 `-p` 與其prompt，其他模型／sampler設定保留，即進互動模式。不需要新增cache flags或啟動daemon。互動模式會另建啟動畫面顯示的`/tmp/h3-XXXXXX`目錄，不沿用單次命令的`-o`；要保留成品請依顯示路徑複製，或用`!save PATH`保存。
