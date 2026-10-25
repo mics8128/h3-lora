@@ -23,6 +23,8 @@ static void usage(const char *program) {
         "       %s -d MODEL_DIR --info\n\n"
         "Options:\n"
         "  -d, --model-dir PATH   MiniMax-H3 local directory\n"
+        "      --manifest PATH     Execute strict version-1 JSON manifest (standalone)\n"
+        "      --capabilities-json  Probe native interfaces without loading models\n"
         "  -p, --prompt TEXT      Raw H3 prompt\n"
         "  -o, --output PATH      Output MP4 (default: outputs/h3.mp4)\n"
         "      --width N          Output width (default: 864)\n"
@@ -39,8 +41,8 @@ static void usage(const char *program) {
         "      --ssd-streaming    Stream original BF16 DiT layers from SSD\n"
         "      --lora PATH STRENGTH  Add immutable adapter (repeatable)\n"
         "      --lora-model fl2va|ref2va  Immutable adapter target (default fl2va)\n"
-        "      --sampler euler|lcm|res_multistep  Default euler\n"
-        "      --scheduler serving|simple  Default serving; serving requires Euler\n"
+        "      --sampler euler|lcm|res_multistep|er_sde  Default euler\n"
+        "      --scheduler serving|simple|beta|beta57  Default serving; serving requires Euler\n"
         "      --video-shift FLOAT --audio-shift FLOAT  Defaults 12 and 3\n"
         "      --use-int8-row-fc2 Faster one-scale int8 FC2 (M5)\n"
         "      --use-reference-rope  Disable native 256 RoPE adaptation\n"
@@ -57,6 +59,12 @@ static void usage(const char *program) {
         "      --seed N           Random seed (default: 42)\n"
         "      --first-frame PATH First-frame conditioning image\n"
         "      --last-frame PATH  Last-frame conditioning image\n"
+        "      --guide-image FRAME PATH  Append image at resolved target frame\n"
+        "      --guide-clip FRAME PATH   Append timed silent clip\n"
+        "      --guide-audio FRAME PATH  Append timed audio\n"
+        "      --guide-clip-audio FRAME PATH  Append clip with embedded audio\n"
+        "      --guide-source-start N --guide-source-frames N  Set preceding guide trim\n"
+        "      --guide-audio-path PATH  Pair preceding clip guide with external audio\n"
         "      --ref-image PATH    Append an ordered Ref2VA image\n"
         "      --ref-image-size S  Image sizing: match (default) or max\n"
         "      --ref-video PATH    Append video, including embedded audio\n"
@@ -249,6 +257,10 @@ static int cli_frame(const h3_frame *frame, void *opaque) {
 }
 
 int main(int argc, char **argv) {
+    if (argc == 2 && !strcmp(argv[1], "--capabilities-json"))
+        return h3_cli_capabilities();
+    if (argc == 3 && !strcmp(argv[1], "--manifest"))
+        return h3_cli_manifest(argv[2]);
     if (atexit(free_cli_loras) != 0) return 1;
     size_t lora_count = 0, lora_capacity = 0;
     enum { OPT_WIDTH = 1000, OPT_HEIGHT, OPT_RENDER_WIDTH, OPT_RENDER_HEIGHT,
@@ -274,8 +286,17 @@ int main(int argc, char **argv) {
            OPT_REF_VIDEO, OPT_REF_SILENT_VIDEO, OPT_REF_VIDEO_AUDIO,
            OPT_REF_AUDIO, OPT_FRAMES_DIR, OPT_SHOW, OPT_ZOOM,
            OPT_PROFILE, OPT_INFO, OPT_LORA, OPT_LORA_MODEL, OPT_SAMPLER,
-           OPT_SCHEDULER, OPT_VIDEO_SHIFT, OPT_AUDIO_SHIFT };
+           OPT_SCHEDULER, OPT_VIDEO_SHIFT, OPT_AUDIO_SHIFT,
+           OPT_GUIDE_IMAGE, OPT_GUIDE_CLIP, OPT_GUIDE_AUDIO, OPT_GUIDE_CLIP_AUDIO,
+           OPT_GUIDE_SOURCE_START, OPT_GUIDE_SOURCE_FRAMES, OPT_GUIDE_AUDIO_PATH };
     static const struct option options[] = {
+        {"guide-image", required_argument, NULL, OPT_GUIDE_IMAGE},
+        {"guide-clip", required_argument, NULL, OPT_GUIDE_CLIP},
+        {"guide-audio", required_argument, NULL, OPT_GUIDE_AUDIO},
+        {"guide-clip-audio", required_argument, NULL, OPT_GUIDE_CLIP_AUDIO},
+        {"guide-source-start", required_argument, NULL, OPT_GUIDE_SOURCE_START},
+        {"guide-source-frames", required_argument, NULL, OPT_GUIDE_SOURCE_FRAMES},
+        {"guide-audio-path", required_argument, NULL, OPT_GUIDE_AUDIO_PATH},
         {"model-dir", required_argument, NULL, 'd'},
         {"prompt", required_argument, NULL, 'p'},
         {"output", required_argument, NULL, 'o'},
@@ -343,6 +364,8 @@ int main(int argc, char **argv) {
     h3_lora_model lora_target = H3_LORA_FL2VA;
     h3_reference references[12];
     size_t reference_count = 0;
+    h3_guide guides[130];
+    size_t guide_count = 0;
     cli_state cli = {{0}, 0, -1, -1, H3_TERM_NONE, 0, NULL, 0};
     int show = 0;
     int profile = 0;
@@ -353,17 +376,30 @@ int main(int argc, char **argv) {
     int option;
     while ((option = getopt_long(argc, argv, "d:p:o:h", options, NULL)) != -1) {
         switch (option) {
+            case OPT_GUIDE_IMAGE: case OPT_GUIDE_CLIP: case OPT_GUIDE_AUDIO: case OPT_GUIDE_CLIP_AUDIO:
+                if(guide_count>=128 || optind>=argc) { fprintf(stderr,"h3: guide requires FRAME PATH (maximum 128 guides)\n");return 2; }
+                guides[guide_count++]=(h3_guide){.kind=(h3_guide_kind)(option-OPT_GUIDE_IMAGE),.frame_index=parse_int(optarg,"guide frame"),.path=argv[optind++],.include_embedded_audio=option==OPT_GUIDE_CLIP_AUDIO};
+                break;
+            case OPT_GUIDE_SOURCE_START: case OPT_GUIDE_SOURCE_FRAMES: case OPT_GUIDE_AUDIO_PATH:
+                if(!guide_count) {fprintf(stderr,"h3: guide modifier requires a preceding guide\n");return 2;}
+                if(option==OPT_GUIDE_SOURCE_START) guides[guide_count-1].source_start_frame=parse_int(optarg,"guide source start");
+                else if(option==OPT_GUIDE_SOURCE_FRAMES) guides[guide_count-1].source_frames=parse_int(optarg,"guide source frames");
+                else {guides[guide_count-1].audio_path=optarg;guides[guide_count-1].include_embedded_audio=0;}
+                break;
             case OPT_VIDEO_SHIFT: params.video_shift = parse_shift(optarg); break;
             case OPT_AUDIO_SHIFT: params.audio_shift = parse_shift(optarg); break;
             case OPT_SAMPLER:
                 if (!strcmp(optarg, "euler")) params.sampler = H3_SAMPLER_EULER;
                 else if (!strcmp(optarg, "lcm")) params.sampler = H3_SAMPLER_LCM;
                 else if (!strcmp(optarg, "res_multistep")) params.sampler = H3_SAMPLER_RES_MULTISTEP;
+                else if (!strcmp(optarg, "er_sde")) params.sampler = H3_SAMPLER_ER_SDE;
                 else { fprintf(stderr, "h3: unknown sampler: %s\n", optarg); return 2; }
                 break;
             case OPT_SCHEDULER:
                 if (!strcmp(optarg, "serving")) params.scheduler = H3_SCHEDULER_SERVING;
                 else if (!strcmp(optarg, "simple")) params.scheduler = H3_SCHEDULER_SIMPLE;
+                else if (!strcmp(optarg, "beta")) params.scheduler = H3_SCHEDULER_BETA;
+                else if (!strcmp(optarg, "beta57")) params.scheduler = H3_SCHEDULER_BETA57;
                 else { fprintf(stderr, "h3: unknown scheduler: %s\n", optarg); return 2; }
                 break;
             case OPT_LORA_MODEL:
@@ -561,10 +597,10 @@ int main(int argc, char **argv) {
     for (size_t i = 0; i < lora_count; i++)
         active_loras |= cli_loras[i].strength != 0.0f;
     if ((params.scheduler == H3_SCHEDULER_SERVING && params.sampler != H3_SAMPLER_EULER) ||
-        (params.scheduler == H3_SCHEDULER_SIMPLE &&
+        (params.scheduler != H3_SCHEDULER_SERVING &&
          (params.denoise_reuse != 1 || params.core_reuse != 1 || params.token_reduction ||
           params.dit_layers != H3_DEFAULT_DIT_LAYERS || params.render_width || params.render_height))) {
-        fprintf(stderr, "h3: serving requires Euler; simple requires full canvas, 50 blocks, no token reduction, reuse/core-reuse 1\n");
+        fprintf(stderr, "h3: serving requires Euler; simple/beta/beta57 require full canvas, 50 blocks, no token reduction, reuse/core-reuse 1\n");
         return 2;
     }
     if (active_loras && (params.ssd_streaming ||
@@ -580,6 +616,8 @@ int main(int argc, char **argv) {
     }
     params.references = references;
     params.reference_count = reference_count;
+    params.guides = guides;
+    params.guide_count = guide_count;
     if (cli.frames_dir && mkdir(cli.frames_dir, 0755) != 0 &&
         errno != EEXIST) {
         fprintf(stderr, "h3: cannot create frames directory %s: %s\n",
@@ -596,6 +634,9 @@ int main(int argc, char **argv) {
     if (ctx->loras) h3_lora_stack_report(ctx->loras, stderr);
     if (info) print_info(ctx);
     if (prompt) {
+        if(params.first_frame) guides[params.guide_count++]=(h3_guide){.kind=H3_GUIDE_IMAGE,.path=params.first_frame,.frame_index=0};
+        if(params.last_frame) guides[params.guide_count++]=(h3_guide){.kind=H3_GUIDE_IMAGE,.path=params.last_frame,.frame_index=params.frames-1};
+        params.first_frame=params.last_frame=NULL;
         params.output_path = output;
         params.on_progress = cli_progress;
         params.callback_opaque = &cli;

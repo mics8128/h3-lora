@@ -21,9 +21,9 @@ typedef struct h3_ctx h3_ctx;
 typedef struct h3_result h3_result;
 
 typedef enum { H3_SAMPLER_EULER = 0, H3_SAMPLER_LCM = 1,
-               H3_SAMPLER_RES_MULTISTEP = 2 } h3_sampler_kind;
-typedef enum { H3_SCHEDULER_SERVING = 0,
-               H3_SCHEDULER_SIMPLE = 1 } h3_scheduler_kind;
+               H3_SAMPLER_RES_MULTISTEP = 2, H3_SAMPLER_ER_SDE = 3 } h3_sampler_kind;
+typedef enum { H3_SCHEDULER_SERVING = 0, H3_SCHEDULER_SIMPLE = 1,
+               H3_SCHEDULER_BETA = 2, H3_SCHEDULER_BETA57 = 3 } h3_scheduler_kind;
 typedef enum { H3_LORA_FL2VA = 0, H3_LORA_REF2VA = 1 } h3_lora_model;
 
 typedef struct {
@@ -46,6 +46,19 @@ typedef struct {
     const char *audio_path;
     int include_embedded_audio;
 } h3_reference;
+
+typedef enum { H3_GUIDE_IMAGE, H3_GUIDE_CLIP, H3_GUIDE_AUDIO,
+               H3_GUIDE_CLIP_AUDIO } h3_guide_kind;
+typedef struct {
+    h3_guide_kind kind;
+    const char *path;
+    const char *audio_path;
+    int frame_index;
+    int source_start_frame, source_frames;
+    int include_embedded_audio;
+} h3_guide;
+/* Return 0 to continue, 1 to pause, 2 to cancel. */
+typedef int (*h3_transition_callback)(int completed, int total, void *opaque);
 
 typedef enum {
     H3_REFERENCE_IMAGE_MATCH = 0,
@@ -136,13 +149,21 @@ typedef struct {
     h3_scheduler_kind scheduler;
     float video_shift;
     float audio_shift;
+    const h3_guide *guides;
+    size_t guide_count;
+    const char *initial_latent_path, *mask_path;
+    int start_transition;
+    const char *resume_path, *checkpoint_path, *latent_output_path;
+    const char *request_digest; /* canonical SHA-256, 64 hexadecimal digits */
+    h3_transition_callback on_transition;
 } h3_params;
 
 #define H3_PARAMS_DEFAULT { \
     H3_DEFAULT_WIDTH, H3_DEFAULT_HEIGHT, H3_DEFAULT_FRAMES, H3_DEFAULT_STEPS, \
     UINT64_C(42), NULL, NULL, NULL, NULL, 0, H3_REFERENCE_IMAGE_MATCH, \
     1, H3_DEFAULT_DIT_LAYERS, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, NULL, NULL, NULL, \
-    H3_SAMPLER_EULER, H3_SCHEDULER_SERVING, 12.0f, 3.0f \
+    H3_SAMPLER_EULER, H3_SCHEDULER_SERVING, 12.0f, 3.0f, \
+    NULL, 0, NULL, NULL, 0, NULL, NULL, NULL, NULL, NULL \
 }
 
 typedef struct {
@@ -178,6 +199,8 @@ struct h3_result {
     int fps;
     int sample_rate;
     uint64_t seed;
+    int status; /* 0 succeeded, 1 paused, 2 cancelled */
+    int diagnostic_preview; /* nonterminal checkpoint decode, never a final clean result */
 };
 
 typedef struct {
@@ -194,6 +217,8 @@ const h3_lora_spec *h3_get_loras(const h3_ctx *ctx, size_t *count);
 void h3_free(h3_ctx *ctx);
 
 const char *h3_last_error(const h3_ctx *ctx);
+const char *h3_last_error_code(const h3_ctx *ctx);
+const char *h3_last_error_field(const h3_ctx *ctx);
 const h3_device_info *h3_device(const h3_ctx *ctx);
 const h3_model_info *h3_model(const h3_ctx *ctx);
 
@@ -206,6 +231,12 @@ void h3_cache_get_info(const h3_ctx *ctx, h3_cache_info *info);
 /* Generate media, delivering decoded frames incrementally through on_frame. */
 h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
                        const h3_params *params);
+h3_result *h3_resume(h3_ctx *ctx, const char *prompt, const h3_params *params);
+/* stream_policy: 1 video, 2 audio, 3 audiovisual. */
+h3_result *h3_encode_media(h3_ctx *ctx, const char *input_path,
+    int stream_policy, const h3_params *params);
+h3_result *h3_decode_latent(h3_ctx *ctx, const char *input_path,
+    int diagnostic_preview, const h3_params *params);
 void h3_result_free(h3_result *result);
 
 #ifdef __cplusplus

@@ -75,9 +75,26 @@ static void free_tensor(h3_gpu_tensor **tensor) {
     *tensor = NULL;
 }
 
+int h3_dit_curve_interpolate(const float *table, uint32_t rows,
+                              uint32_t width, float time, float *output) {
+    if (!table || !output || rows != 1025 || width != 8 || !isfinite(time))
+        return 0;
+    float position = fminf(1.0f, fmaxf(0.0f, time)) * (float)(rows - 1);
+    uint32_t lower = (uint32_t)floorf(position);
+    if (lower >= rows - 1) lower = rows - 2;
+    float fraction = position - (float)lower;
+    for (uint32_t column = 0; column < width; column++) {
+        float a = table[(size_t)lower * width + column];
+        float b = table[(size_t)(lower + 1) * width + column];
+        output[column] = a + fraction * (b - a);
+    }
+    return 1;
+}
+
 static int prepare_rows(h3_dit_schedule *schedule,
                         const h3_sigma_schedule *sigmas,
                         int visual_condition, int audio_condition,
+                        const float *curve,
                         float **features_out, char *error,
                         size_t error_size) {
     schedule->steps = sigmas->steps;
@@ -132,7 +149,8 @@ static int prepare_rows(h3_dit_schedule *schedule,
         return 0;
     }
     float *times = calloc(count, sizeof(*times));
-    float *features = malloc((size_t)count * TIME_INPUT * sizeof(*features));
+    uint32_t width = curve ? 8 : TIME_INPUT;
+    float *features = malloc((size_t)count * width * sizeof(*features));
     if (!times || !features) {
         free(times);
         free(features);
@@ -146,6 +164,16 @@ static int prepare_rows(h3_dit_schedule *schedule,
     if (visual_condition) times[visual_condition_row] = 0.999f;
     if (audio_condition) times[audio_condition_row] = 1.0f;
     for (uint32_t row = 0; row < count; row++) {
+        if (curve) {
+            if (!h3_dit_curve_interpolate(curve, 1025, 8, times[row],
+                                           features + (size_t)row * 8)) {
+                free(times);
+                free(features);
+                fail(error, error_size, "invalid curve timestep");
+                return 0;
+            }
+            continue;
+        }
         for (uint32_t index = 0; index < TIME_INPUT / 2; index++) {
             float frequency = expf(-logf(10000.0f) *
                                    (float)index / (float)(TIME_INPUT / 2));
@@ -234,6 +262,55 @@ cleanup:
     return result;
 }
 
+static int validate_curve_schema(const h3_weight_store *weights, int curve,
+                                  char *error, size_t error_size) {
+    if (curve && h3_weight_find(weights, "time_embedder.proj_in.weight", NULL)) {
+        fail(error, error_size, "mixed full-width and curve AdaLN checkpoint");
+        return 0;
+    }
+    for (unsigned index = 0; index <= H3_DIT_BLOCKS; index++) {
+        char name[128];
+        if (index < H3_DIT_BLOCKS)
+            snprintf(name, sizeof(name), "blocks.%u.adaln_proj.linear.weight", index);
+        else snprintf(name, sizeof(name), "final_layer.adaln_proj.linear.weight");
+        const h3_st_tensor *weight = h3_weight_find(weights, name, NULL);
+        if (!curve) {
+            if (weight && weight->ndim == 2 && weight->shape[1] == 8) {
+                fail(error, error_size, "rank8 AdaLN checkpoint is missing adaln_t_table");
+                return 0;
+            }
+            continue;
+        }
+        uint64_t rows = index < H3_DIT_BLOCKS ? BLOCK_OUTPUT : FINAL_OUTPUT;
+        if (!weight || weight->dtype != H3_DTYPE_F32 || weight->ndim != 2 ||
+            weight->shape[0] != rows || weight->shape[1] != 8) {
+            fail(error, error_size, "unsupported curve projection %s; expected F32 [%llu,8]",
+                 name, (unsigned long long)rows);
+            return 0;
+        }
+        char *suffix = strrchr(name, '.');
+        strcpy(suffix + 1, "bias");
+        const h3_st_tensor *bias = h3_weight_find(weights, name, NULL);
+        if (!bias || bias->dtype != H3_DTYPE_F32 || bias->ndim != 1 ||
+            bias->shape[0] != rows) {
+            fail(error, error_size, "unsupported curve bias %s", name);
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static int curve_project(h3_gpu *gpu, h3_gpu_tensor *output,
+                         const h3_gpu_tensor *time,
+                         const h3_gpu_tensor *weight,
+                         const h3_gpu_tensor *bias,
+                         uint32_t rows, uint32_t columns,
+                         h3_gpu_tensor *wide) {
+    return h3_gpu_linear_f32(gpu, wide, time, weight, bias, rows, 8, columns) &&
+        h3_gpu_cast_f32_to_bf16(gpu, output, wide, rows * columns) &&
+        h3_gpu_submit(gpu);
+}
+
 h3_dit_schedule *h3_dit_schedule_precompute(
     const h3_weight_store *weights, h3_gpu *gpu,
     const h3_sigma_schedule *sigmas, int visual_condition,
@@ -253,13 +330,36 @@ h3_dit_schedule *h3_dit_schedule_precompute(
     }
     schedule->gpu = gpu;
     float *features = NULL;
+    h3_gpu_tensor *curve_scratch = NULL;
+    float curve_table[1025 * 8];
+    const h3_st_header *curve_header = NULL;
+    const h3_st_tensor *curve = h3_weight_find(weights, "adaln_t_table", &curve_header);
+    if (curve && (curve->dtype != H3_DTYPE_F32 || curve->ndim != 2 ||
+        curve->shape[0] != 1025 || curve->shape[1] != 8 ||
+        !h3_st_read_data(curve_header, curve, curve_table, sizeof(curve_table),
+                         error, error_size))) {
+        if (!error || !*error) fail(error, error_size, "unsupported AdaLN curve table; expected F32 [1025,8]");
+        goto failed;
+    }
+    if (!validate_curve_schema(weights, curve != NULL, error, error_size)) goto failed;
     if (!prepare_rows(schedule, sigmas, visual_condition, audio_condition,
+                      curve ? curve_table : NULL,
                       &features, error, error_size)) goto failed;
-    h3_gpu_tensor *time = time_embeddings(weights, gpu, schedule->time_rows,
-                                           features, error, error_size);
+    h3_gpu_tensor *time = curve ? h3_gpu_tensor_from_f32(
+        gpu, features, (size_t)schedule->time_rows * 8) :
+        time_embeddings(weights, gpu, schedule->time_rows, features, error, error_size);
     free(features);
     features = NULL;
     if (!time) goto failed;
+    if (curve) {
+        curve_scratch = h3_gpu_tensor_new_f32(
+            gpu, (size_t)schedule->time_rows * BLOCK_OUTPUT);
+        if (!curve_scratch) {
+            fail(error, error_size, "cannot allocate curve projection scratch: %s", h3_gpu_error(gpu));
+            h3_gpu_tensor_free(time);
+            goto failed;
+        }
+    }
 
     for (unsigned block = 0; block < H3_DIT_BLOCKS; block++) {
         char weight_name[128], bias_name[128], operation[128];
@@ -267,11 +367,13 @@ h3_dit_schedule *h3_dit_schedule_precompute(
                  "blocks.%u.adaln_proj.linear.weight", block);
         snprintf(bias_name, sizeof(bias_name),
                  "blocks.%u.adaln_proj.linear.bias", block);
-        h3_gpu_tensor *weight = weight_bf16_2d(
-            weights, gpu, weight_name, BLOCK_OUTPUT, H3_DIT_TIME_DIM,
-            error, error_size);
-        h3_gpu_tensor *bias = weight_bf16_1d(
-            weights, gpu, bias_name, BLOCK_OUTPUT, error, error_size);
+        h3_gpu_tensor *weight = curve ? weight_f32_2d(
+            weights, gpu, weight_name, BLOCK_OUTPUT, 8, error, error_size) :
+            weight_bf16_2d(weights, gpu, weight_name, BLOCK_OUTPUT,
+                           H3_DIT_TIME_DIM, error, error_size);
+        h3_gpu_tensor *bias = curve ? weight_f32_1d(
+            weights, gpu, bias_name, BLOCK_OUTPUT, error, error_size) :
+            weight_bf16_1d(weights, gpu, bias_name, BLOCK_OUTPUT, error, error_size);
         schedule->blocks[block] = h3_gpu_tensor_new_bf16(
             gpu, (size_t)schedule->time_rows * BLOCK_OUTPUT);
         if (!weight || !bias || !schedule->blocks[block]) {
@@ -285,11 +387,13 @@ h3_dit_schedule *h3_dit_schedule_precompute(
         }
         snprintf(operation, sizeof(operation), "AdaLN block %u", block);
         int ok = gpu_op(gpu, h3_gpu_begin(gpu), error, error_size, operation) &&
-            gpu_op(gpu, h3_gpu_linear_bf16(
+            gpu_op(gpu, curve ? curve_project(
+                gpu, schedule->blocks[block], time, weight, bias,
+                schedule->time_rows, BLOCK_OUTPUT, curve_scratch) : h3_gpu_linear_bf16(
                 gpu, schedule->blocks[block], time, weight, bias,
                 schedule->time_rows, H3_DIT_TIME_DIM, BLOCK_OUTPUT),
                 error, error_size, operation) &&
-            gpu_op(gpu, h3_gpu_submit(gpu), error, error_size, operation);
+            (curve || gpu_op(gpu, h3_gpu_submit(gpu), error, error_size, operation));
         free_tensor(&weight);
         free_tensor(&bias);
         if (!ok) {
@@ -300,18 +404,25 @@ h3_dit_schedule *h3_dit_schedule_precompute(
                                progress_opaque);
     }
 
-    h3_gpu_tensor *final_w = weight_bf16_2d(
+    h3_gpu_tensor *final_w = curve ? weight_f32_2d(
+        weights, gpu, "final_layer.adaln_proj.linear.weight", FINAL_OUTPUT, 8,
+        error, error_size) : weight_bf16_2d(
         weights, gpu, "final_layer.adaln_proj.linear.weight",
         FINAL_OUTPUT, H3_DIT_TIME_DIM, error, error_size);
-    h3_gpu_tensor *final_b = weight_bf16_1d(
+    h3_gpu_tensor *final_b = curve ? weight_f32_1d(
+        weights, gpu, "final_layer.adaln_proj.linear.bias", FINAL_OUTPUT,
+        error, error_size) : weight_bf16_1d(
         weights, gpu, "final_layer.adaln_proj.linear.bias",
         FINAL_OUTPUT, error, error_size);
-    schedule->final = h3_gpu_tensor_new_bf16(
-        gpu, (size_t)schedule->time_rows * FINAL_OUTPUT);
+    schedule->final = curve ? h3_gpu_tensor_new_f32(
+        gpu, (size_t)schedule->time_rows * FINAL_OUTPUT) :
+        h3_gpu_tensor_new_bf16(gpu, (size_t)schedule->time_rows * FINAL_OUTPUT);
     if (!final_w || !final_b || !schedule->final ||
         !gpu_op(gpu, h3_gpu_begin(gpu), error, error_size,
                 "begin final AdaLN") ||
-        !gpu_op(gpu, h3_gpu_linear_bf16(
+        !gpu_op(gpu, curve ? h3_gpu_linear_f32(
+            gpu, schedule->final, time, final_w, final_b,
+            schedule->time_rows, 8, FINAL_OUTPUT) : h3_gpu_linear_bf16(
             gpu, schedule->final, time, final_w, final_b, schedule->time_rows,
             H3_DIT_TIME_DIM, FINAL_OUTPUT), error, error_size,
             "final AdaLN projection") ||
@@ -328,10 +439,12 @@ h3_dit_schedule *h3_dit_schedule_precompute(
     free_tensor(&final_w);
     free_tensor(&final_b);
     h3_gpu_tensor_free(time);
+    h3_gpu_tensor_free(curve_scratch);
     return schedule;
 
 failed:
     free(features);
+    h3_gpu_tensor_free(curve_scratch);
     h3_dit_schedule_free(schedule);
     return NULL;
 }
@@ -383,6 +496,11 @@ uint32_t h3_dit_schedule_audio_condition_row(
 const h3_gpu_tensor *h3_dit_schedule_block(const h3_dit_schedule *schedule,
                                            unsigned block) {
     return schedule && block < H3_DIT_BLOCKS ? schedule->blocks[block] : NULL;
+}
+
+int h3_dit_schedule_final_is_f32(const h3_dit_schedule *schedule) {
+    return schedule && schedule->final &&
+        h3_gpu_tensor_dtype(schedule->final) == H3_GPU_F32;
 }
 
 double h3_dit_schedule_gate_score(const h3_dit_schedule *schedule,
@@ -461,6 +579,7 @@ int h3_dit_schedule_row_map(const h3_dit_schedule *schedule, int step,
             time_row = schedule->visual_condition_rows[step];
             tag = 0;
             break;
+        case H3_SEG_COND_AUDIO:
         case H3_SEG_REF_AUDIO:
             if (!schedule->audio_condition_rows) return 0;
             time_row = schedule->audio_condition_rows[step];

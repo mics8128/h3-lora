@@ -1,18 +1,30 @@
 # h3-lora / h3-metal
 
-Apple Silicon 原生 MiniMax-H3 影音生成：文字／首尾幀走 **FL2VA**，有序圖片、影片、音訊參考走 **Ref2VA**。支援 immutable 多 LoRA、Turbo sampler、互動常駐，以及可選 BF16 video decoder。
+Apple Silicon 原生 MiniMax-H3 影音生成：FL2VA／Ref2VA、immutable 多 LoRA、Turbo、互動常駐與可選 BF16 video decoder。開發版另接入參考＋時間定位 guide、native latent／mask／partial denoise、checkpoint 續跑，以及供小模型使用的結構化任務工具。
 
 這份文件只放**日常用法**。完整 C API、所有速度近似、診斷與測試見 [RUNTIME_REFERENCE.md](RUNTIME_REFERENCE.md)；目前模型、共用依賴及已完成清理見 [MODEL_INVENTORY.md](MODEL_INVENTORY.md)。
 
-模型清理：已依指示刪除4個額外風格LoRA與Eros轉換前／後權重；官方FL2VA／Ref2VA、**21個Turbo全部**及Unlocked均保留。Eros資料夾只剩紀錄與共享連結，不再是可用模型root。
+模型清理：先前依指示刪除4個額外風格LoRA與 **beta6** 轉換前／後權重；官方FL2VA／Ref2VA、**21個Turbo全部**及Unlocked均保留。beta6資料夾仍只剩紀錄。另依新指示安裝作者完整 **Eros Max beta5 BF16**，使用獨立runtime與明確preset，見 [beta5配置](EROS_BETA5_SETUP.md)。
 
-## 階段收案狀態
+## 開發狀態與品質界線
 
-2026-10-25：**目前階段暫時收案，功能凍結，等實際製作流程回饋。** 已發布的runtime基線為`e791b32`（前一階段`a2cfb36`）；本次只整理文件、模型清理紀錄與Astra建議，不新增功能或效能宣稱。
+2026-10-26：依實際製作回饋重開開發。Astra 設計見 [DEVELOPMENT_DESIGN.md](DEVELOPMENT_DESIGN.md)；實作不等於已驗收人物一致性、音色、唇形或無縫接縫。既有128G部署沒有自動更新；新程式在獨立工作目錄驗證，不覆蓋正在使用的原始碼或中斷生成。
 
-主要生成入口、Turbo、互動常駐及BF16選項已有相應實跑證據；這不代表完整ComfyUI相容、長片品質全面驗收或同機效能領先。pruned、LightVAE、encoder新格式、kernel優化與進階生成控制均暫緩，不自動啟動benchmark、下載模型或進一步清理。
+原有 Turbo／resident／BF16 有先前短片證據；新增條件與取樣狀態另作驗收。開發版已接入 beta5 的 rank-8 AdaLN 曲線與 ER-SDE／beta／beta57；這不代表任意 pruned 格式、LightVAE、ConvRot／NVFP4、Sage／TeaCache及官方未開源 Context-IR／2K 都可用。查核來源見 [加速工作流審計](ACCELERATION_WORKFLOW_AUDIT.md)、[品質搭配研究](QUALITY_PROFILE_RESEARCH.md) 與 [beta5配置／驗證](EROS_BETA5_SETUP.md)。沒有同機同條件證據，不能宣稱「7秒1080p／205秒」、「幾乎無損」或「完美續拍」。
 
-先用下列命令做實際工作。只有出現具體品質問題、等待瓶頸或無法表達的必要操作，再以該場景重開；記錄prompt、參考、seed、設定、first／warm耗時及成品，不要求先做全矩陣。詳細候選見[Astra唯讀核查](ASTRA_OPTIMIZATION_PLAN.md#2026-10-25綜合應用與下一階段建議astra唯讀核查)，屬後續參考而非本次待辦。
+## 0. 小模型主要入口：JSON任務，不拼長指令
+
+`tools/h3_tasks.py` 使用 Python 標準函式庫；FFmpeg／FFprobe用於素材探測與明示的媒體處理。管理者先設定 `H3_TASK_ROOT`（可寫任務目錄）、`H3_TASK_CONFIG`（引擎、device、已安裝模型／adapter與完整dependency hashes的設定檔）。所有共用同一GPU的state roots必須使用相同device ID。
+
+```sh
+printf '{}\n' | python3 tools/h3_tasks.py profiles --json \
+  --root "$H3_TASK_ROOT" --config "$H3_TASK_CONFIG"
+```
+
+小模型只需選回傳的profile ID、註冊素材取得asset ID，再依 `prepare → submit → inspect` 使用。`submit`不自行啟動GPU工作；管理者或編排程序執行 `worker`，以一個device一次一個工作處理佇列。`revise`是修改後重生成，`continue`是生成接續內容，`resume`才是恢復原計算；三者不可互換。
+
+`standard_media_v1`將常規裁切／重採樣／音訊補齊列入準備計畫，提交digest表示採用該精確計畫；內容截斷、改台詞、丟條件或降低內部畫布不會靜默執行。完整schema、設定與可執行命令見 [任務介面](RUNTIME_REFERENCE.md#ai-task-interface)。
+
 
 ## 1. 執行位置與設定
 
@@ -51,7 +63,7 @@ mkdir -p outputs
 
 共同使用 `simple`、strength 1、50 layers、reuse/core-reuse 1、shifts 12/3。12/3 是已揭露的採用預設，不是每版作者證實的最優值。`simple` **不能**搭配 reduced layers、reuse>1、token reduction 或較小 internal canvas；要降低草稿解析度，直接改輸出 `--width/--height`。
 
-v1.2 檔名含 `4step`，但其卡片建議起點是 **5步**。草稿v1.0與正式v1.2是不同權重；同seed不代表兩者構圖一致。想只保留v1.2也可用960×544做草稿，但屬跨解析度探索，不稱為原作者最佳設定。詳細來源與早期A/B見 [ACCELERATION_RESEARCH.md](ACCELERATION_RESEARCH.md)。
+v1.2 檔名含 `4step`；本頁保留的5步RES／12–3是既有本機配方，不是已證明最佳的官方設定。LightX作者v1.2發佈建議為4步Euler／6–3；兩組應分開比較，不能將FL2VA的6–3套到Ref2VA。草稿v1.0與v1.2也不同，同seed不保證構圖一致。來源與品質比較設計見 [QUALITY_PROFILE_RESEARCH.md](QUALITY_PROFILE_RESEARCH.md)。
 
 ### 草稿：先看構圖與動作
 
@@ -83,7 +95,7 @@ H3_VAE_PRECISION=f32 ./h3 -d "$MODEL_DIR" \
 
 ### Ref2VA：先選正確base與adapter
 
-以下使用現有驗收素材；自己的素材換掉兩個路徑及prompt。圖片順序會成為`<Picture 1>`、`<Picture 2>`，不是由檔名判定人物／商品。
+以下是既有39幀接線短測，不是正式品質驗收；官方輸出範圍4–15秒，品質比較可用124幀（約5.17秒）。自己的素材需換掉路徑與prompt。圖片順序成為`<Picture 1>`、`<Picture 2>`；人物與聲音關係應按官方格式明確定義，不由檔名推定。
 
 ```sh
 H3_VAE_PRECISION=f32 ./h3 -d "$REF_MODEL_DIR" \
@@ -97,7 +109,7 @@ H3_VAE_PRECISION=f32 ./h3 -d "$REF_MODEL_DIR" \
   -o outputs/reference.mp4
 ```
 
-FL2VA Turbo不能拿來替代Ref2VA Turbo。`--first-frame/--last-frame`是FL2VA首尾幀條件，不是一般Ref2VA參考，兩組入口不能混用。純音訊及混合參考已有實際接線，但不保證音色、節奏、唇形或人物一致性；影片原聲是conditioning，不是原樣拷貝至輸出。[完整參考入口與限制](RUNTIME_REFERENCE.md#8-add-image-video-and-audio-references)。
+FL2VA Turbo不能替代Ref2VA Turbo。開發版將首尾圖統一為時間定位guide；有ordered references時選Ref2VA，可同時帶guide，但必須使用相符Ref2VA adapter。guide是固定條件，不保證輸出像素相同；參考聲音也不保證音色、節奏或唇形，原聲不是原樣拷貝。[完整參考與任務介面](RUNTIME_REFERENCE.md#ai-task-interface)。
 
 ### 2026-10-26：main 整合與 128G 核對
 
@@ -105,7 +117,7 @@ FL2VA Turbo不能拿來替代Ref2VA Turbo。`--first-frame/--last-frame`是FL2VA
 - 128G（`ted`）部署目錄 `/Users/tedmacbookpro/projects/h3-lora` 的 87 個受版控檔案，逐檔 SHA-256 與此功能基準一致。遠端 Git 仍是 upstream `8974cc0` 加未提交部署檔，**檔案一致不代表遠端 Git 已同步 main**；本次未切換分支、覆蓋檔案或重啟工作。
 - 遠端 `make -q h3` 回傳 0，表示依現有 Makefile 與檔案時間無待重建項目；這不是執行檔可重現建置的雜湊證明。
 - 在遠端以既有 Ref2VA root，同時傳入 `--ref-image`、`--ref-audio`、`--first-frame`，512×512／22幀／2步，實際 CLI 回傳 exit 1：`h3: full references cannot be combined with frame anchors`。請求在參數驗證階段拒絕，未生成影片。
-- **目前不能以「參考圖＋參考聲音＋指定首圖」三項同時產片。** 圖＋音可走 Ref2VA（既有短片接線證據見 [相容性研究](REF_COMPATIBILITY_RESEARCH.md) 的實跑驗收段落）；首圖條件走 FL2VA，不能再混入 Ref2VA 圖／音。把首圖改為另一張 `--ref-image` 只是軟參考，不等於首幀錨定；聲音參考也不保證原音照搬、音色或唇形。
+- **該次核對的舊部署不能三項同用。** 後續開發版已加入references＋guides，不能把本段舊部署拒絕紀錄當成新程式或模型本質的限制。反之，開發版可編碼也不代表舊部署已更新或首幀／聲音品質已保證。
 - 核對當下遠端有 video-maker 的 Ref2VA 圖／音工作執行中；未中斷、未另啟完整推論。本次驗證的是三項組合確實被拒絕，不是重新驗收圖／音生成品質。
 
 
@@ -159,11 +171,13 @@ rsync -av ted:/Users/tedmacbookpro/projects/h3-lora/outputs/final.mp4 \
 | 人物＋商品＋動作／聲音參考 | 同一次Ref2VA命令重複reference flags即可 | 不必為每個參考拆一次；不保證身份或口型品質 |
 | 草稿→正式 | 先低解析度篩選，再用正式設定重新生成 | 不是同latent接續refine；換權重／畫布可能改構圖 |
 | 多鏡頭成片、字幕、配樂、外部放大 | 分別產生片段，再用FFmpeg或其他製片工具組合 | 外部處理，不代表H3引擎內有對應節點；外部工具另需具備該能力 |
-| 接續一個鏡頭 | 抽前片尾幀作下一次FL2VA first-frame，或把前片作Ref2VA參考 | 可做接續流程，但不是共享latent的無縫延續，誤差可能累積 |
-| 任意時間點的多個guide／局部遮罩重繪／ControlNet | 目前不能以幾次CLI等價替代 | 需要引擎實作相應conditioning、mask或控制模型 |
-| latent放大後partial-denoise refine | 目前沒有對應CLI契約 | 需要latent輸入／輸出、起始噪聲與schedule續接，不能把重新生成稱為refine |
+| 接續一個鏡頭 | 任務`continue`選bounded tail guide，明示overlap與join policy | 新片段生成，不是checkpoint resume；不保證無縫，拼接是明示後製 |
+| 任意時間點的圖片／短片／音訊guide | native guides與任務`prepare` | 條件定位，不能冒充輸出latent或原音硬鎖 |
+| 同畫布latent局部去噪 | native clean latent＋同形狀mask＋start_transition；任務`revise` | 0保留／1生成，保留的是latent而非逐像素畫面；不是通用像素遮罩編輯器 |
+| 中斷後恢復計算 | `pause`／`resume`與完整sampler checkpoint | 需相同依賴／profile／prompt／schedule；不是只存latent |
+| ControlNet／latent放大refine／官方2K | 尚無對應已接妥契約 | 不能用guide、重新生成或像素resize冒稱完成 |
 
-一般多步流程是編排問題；任意時間點guide、mask、ControlNet與latent refine才是新增生成原語。ComfyUI workflow JSON／custom nodes不能直接由本程式執行，也不宣稱輸出逐像素相同。需要完整進階控制時仍可選ComfyUI；不必為一般批次與剪接先建立一套節點框架。
+ComfyUI workflow JSON／custom nodes不能直接執行；本機任務規格只表達引擎真實能力，不建立任意節點平台，也不宣稱與Comfy逐像素等價。
 
 ## 6. 效能定位與下一步
 

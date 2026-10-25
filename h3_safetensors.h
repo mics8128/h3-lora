@@ -57,5 +57,8 @@ const char *h3_dtype_name(h3_dtype dtype);
 
 int h3_st_inventory_dir(const char *directory, h3_component_info *info,
                         char *error, size_t error_size);
+/* Missing or empty is allowed; unreadable, non-directory and malformed fail. */
+int h3_st_inventory_dir_optional(const char *directory, h3_component_info *info,
+                                 char *error, size_t error_size);
 
 #endif

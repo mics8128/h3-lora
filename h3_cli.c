@@ -29,6 +29,8 @@ typedef struct {
     const char *model_dir;
     h3_params params;
     h3_reference references[12];
+    h3_guide guides[128];
+    size_t guide_count;
     char *first_frame;
     char *last_frame;
     char output_dir[H3_CLI_PATH];
@@ -169,6 +171,10 @@ static void print_help(void) {
     puts("  !reference-rope [on|off]  Toggle released spatial RoPE");
     puts("  !first [PATH|clear]      Set, show, or clear first frame");
     puts("  !last [PATH|clear]       Set, show, or clear last frame");
+    puts("  !guide-image|clip|audio|clip-audio FRAME PATH  Append a timed guide");
+    puts("  !guides [clear]          List or clear timed guides");
+    puts("  !guide-span START FRAMES Set last guide source span (clips require 17k+5)");
+    puts("  !guide-audio-path PATH   Pair last clip guide with external audio");
     puts("  !ref-image PATH          Append an ordered Ref2VA image");
     puts("  !refs [clear]            List or clear ordered references");
     puts("  !ref-remove N            Remove ordered reference N");
@@ -189,8 +195,11 @@ static void print_status(const h3_cli_state *state) {
     else puts("LoRA stack: none (fixed for this context)");
     printf("Sampler: %s | scheduler: %s | video/audio shifts: %.9g/%.9g\n",
            state->params.sampler == H3_SAMPLER_EULER ? "euler" :
-           state->params.sampler == H3_SAMPLER_LCM ? "lcm" : "res_multistep",
-           state->params.scheduler == H3_SCHEDULER_SIMPLE ? "simple" : "serving",
+           state->params.sampler == H3_SAMPLER_LCM ? "lcm" :
+           state->params.sampler == H3_SAMPLER_ER_SDE ? "er_sde" : "res_multistep",
+           state->params.scheduler == H3_SCHEDULER_SIMPLE ? "simple" :
+           state->params.scheduler == H3_SCHEDULER_BETA ? "beta" :
+           state->params.scheduler == H3_SCHEDULER_BETA57 ? "beta57" : "serving",
            (double)state->params.video_shift, (double)state->params.audio_shift);
     if (state->ctx->loras)
         printf("Immutable LoRA target: %s\n",
@@ -322,10 +331,6 @@ static void add_reference_image(h3_cli_state *state, char *argument) {
         fprintf(stderr, "Usage: !ref-image PATH\n");
         return;
     }
-    if (state->first_frame || state->last_frame) {
-        fprintf(stderr, "h3: Ref2VA references cannot be combined with frame anchors\n");
-        return;
-    }
     if (!h3_model(state->ctx)->ref2va_transformer.files) {
         fprintf(stderr, "h3: !ref-image requires the Ref2VA checkpoint\n");
         return;
@@ -385,10 +390,6 @@ static void set_anchor(h3_cli_state *state, int first, char *argument) {
         printf("%s: none\n", name);
         return;
     }
-    if (state->params.reference_count) {
-        fprintf(stderr, "h3: frame anchors cannot be combined with Ref2VA references\n");
-        return;
-    }
     if (!validate_anchor(argument)) return;
     char *copy = strdup(argument);
     if (!copy) {
@@ -442,8 +443,13 @@ static int generate(h3_cli_state *state, const char *prompt) {
     }
     h3_params params = state->params;
     params.seed = state->random_seed ? random_seed() : state->params.seed;
-    params.first_frame = state->first_frame;
-    params.last_frame = state->last_frame;
+    h3_guide guides[130];
+    memcpy(guides, state->guides, state->guide_count * sizeof(*guides));
+    params.guides = guides;
+    params.guide_count = state->guide_count;
+    if (state->first_frame) guides[params.guide_count++] = (h3_guide){.kind=H3_GUIDE_IMAGE,.path=state->first_frame,.frame_index=0};
+    if (state->last_frame) guides[params.guide_count++] = (h3_guide){.kind=H3_GUIDE_IMAGE,.path=state->last_frame,.frame_index=params.frames-1};
+    params.first_frame = params.last_frame = NULL;
     params.output_path = output;
     params.preview_denoise = state->show && state->terminal != H3_TERM_NONE;
     params.on_frame = params.preview_denoise ? cli_frame : NULL;
@@ -628,6 +634,33 @@ static int process_command(h3_cli_state *state, char *line, int *repeat) {
         }
     } else if (!strcasecmp(command, "first")) set_anchor(state, 1, argument);
     else if (!strcasecmp(command, "last")) set_anchor(state, 0, argument);
+    else if (!strcasecmp(command,"guide-span")) {
+        char *end;errno=0;long start=strtol(argument,&end,10);
+        char *tail=skip_spaces(end),*finish;long frames=strtol(tail,&finish,10);
+        if(!state->guide_count || end==argument || tail==finish || *skip_spaces(finish) || errno || start<0 || start>INT32_MAX || frames<1 || frames>INT32_MAX)
+            fprintf(stderr,"Usage: !guide-span SOURCE_START SOURCE_FRAMES (sets last guide; clips need 17k+5 frames)\n");
+        else {state->guides[state->guide_count-1].source_start_frame=(int)start;state->guides[state->guide_count-1].source_frames=(int)frames;}
+    } else if (!strcasecmp(command,"guide-audio-path")) {
+        if(!state->guide_count || !*argument) fprintf(stderr,"Usage: !guide-audio-path PATH (pairs last guide)\n");
+        else {char *copy=strdup(argument);if(copy){h3_guide *g=&state->guides[state->guide_count-1];free((char*)g->audio_path);g->audio_path=copy;g->include_embedded_audio=0;}}
+    }
+    else if (!strncasecmp(command, "guide-", 6)) {
+        const char *names[] = {"image", "clip", "audio", "clip-audio"};
+        int kind=-1; for(int i=0;i<4;i++) if(!strcasecmp(command+6,names[i])) kind=i;
+        char *end=NULL; errno=0; long frame=strtol(argument,&end,10);
+        if(kind<0 || end==argument || !isspace((unsigned char)*end) || errno || frame<0 || frame>=state->params.frames || state->guide_count>=128 || !*skip_spaces(end))
+            fprintf(stderr,"Usage: !guide-image|clip|audio|clip-audio FRAME PATH (resolved nonnegative frame)\n");
+        else {
+            char *path=strdup(skip_spaces(end));
+            if(path) state->guides[state->guide_count++]=(h3_guide){.kind=(h3_guide_kind)kind,.path=path,.frame_index=(int)frame,.include_embedded_audio=kind==3};
+            else fprintf(stderr,"h3: out of memory copying guide\n");
+        }
+    } else if (!strcasecmp(command,"guides")) {
+        if(!strcasecmp(argument,"clear")) {
+            for(size_t i=0;i<state->guide_count;i++) {free((char*)state->guides[i].path);free((char*)state->guides[i].audio_path);}
+            state->guide_count=0;
+        } else for(size_t i=0;i<state->guide_count;i++) printf("%zu: kind=%d frame=%d %s\n",i+1,state->guides[i].kind,state->guides[i].frame_index,state->guides[i].path);
+    }
     else if (!strcasecmp(command, "ref-image"))
         add_reference_image(state, argument);
     else if (!strcasecmp(command, "refs")) {
@@ -744,6 +777,17 @@ int h3_cli_run(h3_ctx *ctx, const char *model_dir,
         }
         state.params.reference_count++;
     }
+    if(initial->guide_count>128 || (initial->guide_count && !initial->guides)) { clear_references(&state);free(state.first_frame);free(state.last_frame);return 1; }
+    for(size_t i=0;i<initial->guide_count;i++) {
+        state.guides[i]=initial->guides[i];
+        state.guides[i].path=initial->guides[i].path?strdup(initial->guides[i].path):NULL;
+        state.guides[i].audio_path=initial->guides[i].audio_path?strdup(initial->guides[i].audio_path):NULL;
+        if(!state.guides[i].path || (initial->guides[i].audio_path&&!state.guides[i].audio_path)) {
+            for(size_t j=0;j<=i;j++){free((char*)state.guides[j].path);free((char*)state.guides[j].audio_path);}
+            clear_references(&state);free(state.first_frame);free(state.last_frame);return 1;
+        }
+        state.guide_count++;
+    }
     snprintf(state.output_dir, sizeof(state.output_dir), "/tmp/h3-XXXXXX");
     if (!mkdtemp(state.output_dir)) {
         fprintf(stderr, "h3: cannot create session directory: %s\n",
@@ -751,6 +795,7 @@ int h3_cli_run(h3_ctx *ctx, const char *model_dir,
         free(state.first_frame);
         free(state.last_frame);
         clear_references(&state);
+        for(size_t i=0;i<state.guide_count;i++){free((char*)state.guides[i].path);free((char*)state.guides[i].audio_path);}
         return 1;
     }
 
@@ -799,6 +844,7 @@ int h3_cli_run(h3_ctx *ctx, const char *model_dir,
     free(state.last_frame);
     free(state.last_prompt);
     clear_references(&state);
+    for(size_t i=0;i<state.guide_count;i++){free((char*)state.guides[i].path);free((char*)state.guides[i].audio_path);}
     puts("Goodbye.");
     return 0;
 }

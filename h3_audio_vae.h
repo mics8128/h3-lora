@@ -34,8 +34,9 @@ int h3_audio_vae_decode(const char *weight_directory,
                         h3_audio_vae_progress progress, void *progress_opaque,
                         h3_audio_waveform *output,
                         char *error, size_t error_size);
-/* Encode channel-major 32 kHz stereo PCM [2,samples]. The input is zero-padded
- * on the right to the next 800-sample latent boundary. */
+/* Encode channel-major 32 kHz stereo PCM [2,samples], up to 16 seconds.
+ * The input is zero-padded on the right to the next 800-sample latent boundary.
+ * Reference-specific duration policy belongs to the request validator. */
 int h3_audio_vae_encode(const char *weight_directory,
                         const char *shader_source_path,
                         const float *pcm, int samples,

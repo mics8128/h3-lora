@@ -15,6 +15,8 @@ struct h3_ctx {
     struct h3_lora_stack *loras;
     h3_lora_model lora_target;
     char error[512];
+    char error_code[64];
+    char error_field[128];
     h3_device_info device;
     h3_model_info model;
     int cache_enabled;
@@ -29,6 +31,8 @@ struct h3_ctx {
     size_t conditioning_audio_elements;
     h3_layout_ref *conditioning_references;
     size_t conditioning_reference_count;
+    h3_layout_guide *conditioning_guides;
+    size_t conditioning_guide_count;
     int conditioning_present;
     char *dit_key;
     char *dit_model_key;

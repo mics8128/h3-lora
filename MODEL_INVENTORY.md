@@ -1,6 +1,6 @@
 # 模型檔案：目前保留狀態與清理紀錄
 
-主機：`ted`；根目錄：`/Users/tedmacbookpro/projects/h3-models`。依使用者明確指示，已刪除4個額外風格LoRA及Eros轉換前、後的2個權重檔。**其餘模型全部保留，沒有搬移、更名或縮減Turbo比較套件。** 日常用法見[README](README.md)，完整控制項見[RUNTIME_REFERENCE](RUNTIME_REFERENCE.md)。
+主機：`ted`；根目錄：`/Users/tedmacbookpro/projects/h3-models`。先前依使用者指示刪除4個額外風格LoRA及 **beta6** 轉換前、後的2個權重檔；其餘集合保留。2026-10-26另依新指示安裝 **beta5完整BF16與原生轉換檔**，沒有還原beta6或縮減Turbo套件。日常用法見[README](README.md)，完整控制項見[RUNTIME_REFERENCE](RUNTIME_REFERENCE.md)，新增模型見[beta5配置](EROS_BETA5_SETUP.md)。
 
 ## 1. 這次實際刪除
 
@@ -18,9 +18,9 @@
 
 移除的檔案logical size共**133.320GB／124.164GiB**。這不是已保證釋出的磁碟空間：刪除後立即讀取的`statvfs`可用容量未增加，該次觀察反而少約19.49MB；主機同時有其他活動。唯讀檢查發現Data volume有**21個Time Machine本機快照**，均標示purgeable。**[INFERENCE]** 快照或APFS延遲回收可能仍保留資料區塊；沒有證明各檔案的實際reclaimed bytes，也沒有刪除快照、清Time Machine或更動備份設定。
 
-Eros的轉換腳本、header、生成log及symlink保留作紀錄，直接regular-file大小僅196,872bytes；**Eros已不是可供推論的完整模型root**，不應再用它執行生成。`loras-style/`剩82,596bytes下載／來源metadata，4個權重均已刪除；保留metadata不代表模型仍存在。
+beta6的轉換腳本、header、生成log及symlink保留作紀錄，當時直接regular-file大小196,872bytes；**beta6已不是完整推論root**。此處不包含後來新增的beta5。`loras-style/`剩82,596bytes下載／來源metadata，4個權重均已刪除；保留metadata不代表模型仍存在。
 
-## 2. 其餘全部保留
+## 2. 清理當時其餘全部保留（歷史快照）
 
 | 集合 | 直接持有的不同inode logical bytes | 處置 |
 |---|---:|---|
@@ -49,12 +49,12 @@ Eros的轉換腳本、header、生成log及symlink保留作紀錄，直接regula
 
 - `MiniMax-H3-Ref2VA/FL2VA`指向`MiniMax-H3/FL2VA`整棵樹。
 - Ref2VA下的`audio_vae`、`text_encoder`、`tokenizer`、`video_vae`指向官方FL2VA同名組件。
-- Eros留下的4個共享component symlink及transformer config symlink也只作紀錄；其目標均保留。
+- beta6留下的4個共享component symlink及transformer config symlink只作紀錄；目標均保留。新增beta5另有完整權重與獨立共用連結，見下節。
 - [`h3.c`](h3.c)目前在建立context時仍inventory FL2VA組件，即使只做Ref2VA，也不能刪FL2VA樹或只留下config/index而移除shards。
 - text encoder14個shards、各官方transformer13個shards與原始video/audio VAE均保留。BF16 VAE是runtime精度選項，不是另一份權重；LightVAE尚未實作。
 - Larry的`loras/minimax_h3_turbo_v4_step600_pruned_comfyui.safetensors`與`loras-turbo/`同名檔仍共用同一inode。只刪其中一個名字不會回收這份權重；本次兩者都保留。
 
-## 4. 實際驗證與證據
+## 4. 既有清理的驗證與證據（歷史）
 
 刪除前再次核對6檔device/inode、size、mode、mtime及nlink=1，且所有父目錄不是symlink。執行前比較整個model root的regular files／symlink metadata與preflight一致，才允許unlink。
 
@@ -68,6 +68,16 @@ Eros的轉換腳本、header、生成log及symlink保留作紀錄，直接regula
 
 - `plan.json`：刪除前快照、精確6檔身份、open-file警告與原始容量。
 - `removed.json`／`result.json`：逐檔unlink紀錄、操作後metadata比對與容量觀察。
-- `after-inventory.json`：目前保留檔案及symlink metadata。
+- `after-inventory.json`：該次清理後的檔案及symlink metadata快照，不包含後來新增的beta5。
 
 清理前原始盤點仍在`/Users/mics/Movies/H3-Model-Inventory-20261024/`；其中`inventory.json`與`summary.json`是**歷史快照，不是目前清單**。這次沒有建立權重備份；來源檔亦已依使用者授權刪除。任何再刪除、移動剩餘模型或處理APFS／Time Machine快照，都需另行明確授權。
+
+## 5. 2026-10-26新增：Eros Max beta5
+
+| 路徑（相對模型root） | 實際bytes | SHA-256 |
+|---|---:|---|
+| `Eros-Max-beta5/source/10Eros_Max_h3_TURBO-hybrid_beta5.safetensors` | 40,222,982,192 | `098f138f3e899d03821dd8296c8db3db6fa16371e50fcdd38661d347fd9a1dfa` |
+| `Eros-Max-beta5/FL2VA/transformer/model.safetensors` | 40,313,058,064 | `a61c17e55237c03f64c3db2620d11a09b5628fdf95fbdf7ac0f78c9dcc4f51bf` |
+
+兩份regular-file均保留；`Ref2VA/transformer`共用後者，不額外複製權重。影音VAE、text encoder、tokenizer共用既有官方FL2VA。這是新增模型，不重算上方清理當時的總量或聲稱APFS獨占／已回收空間。作者完整BF16仍採rank-8 AdaLN/t-table，原生已依實際張量補完；不是以官方值還原成full-width模型。轉換器、模型卡設定、授權、八個preset與實跑證據見 [EROS_BETA5_SETUP.md](EROS_BETA5_SETUP.md)。
+

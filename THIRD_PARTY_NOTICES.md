@@ -44,3 +44,50 @@ Both source trees carry the MIT license, Copyright (c) 2026 Salvatore
 Sanfilippo; the complete permission and warranty notice is retained in
 [LICENSE](LICENSE). Model-weight licenses are separate; these code references
 do not grant rights to H3 or LightVAE weights.
+
+## ER-SDE numerical algorithm and interoperability references
+
+The ER-SDE mathematical solver family is described in Qinpeng Cui et al.,
+[Elucidating the solution space of extended reverse-time SDE for diffusion models](https://arxiv.org/abs/2309.06169).
+The [original solver implementation](https://github.com/QinpengCui/ER-SDE-Solver/tree/25ca6c2e6b065754a55694dc6941a3259fa0f082)
+is MIT-licensed; its notice is retained below for the numerical solver reference/adaptation.
+This fork implements native joint-audiovisual carried state, masks, RNG and checkpoint storage;
+it does not bundle the original Python runtime.
+
+MIT License
+
+Copyright (c) 2023 Qinpeng Cui
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+Additional numerical compatibility references are separately licensed:
+
+- [ComfyUI `fe298e4e20f1ff26d30e8639267bbd0b57811390`](https://github.com/Comfy-Org/ComfyUI/tree/fe298e4e20f1ff26d30e8639267bbd0b57811390):
+  ER-SDE CONST ordering/quadrature, beta-grid behavior and H3 curve/final-layer dtype contracts.
+  Its [license is GPLv3](https://github.com/Comfy-Org/ComfyUI/blob/fe298e4e20f1ff26d30e8639267bbd0b57811390/LICENSE), not this repository's MIT license.
+- [RES4LYF `56e44755d866c87ff9cb4b6608c8e42155db6ecc`, `sigmas.py`1420–1421](https://github.com/ClownsharkBatwing/RES4LYF/blob/56e44755d866c87ff9cb4b6608c8e42155db6ecc/sigmas.py#L1420-L1421):
+  the named `beta57` binding to Beta(.5,.7). Its [license](https://github.com/ClownsharkBatwing/RES4LYF/blob/56e44755d866c87ff9cb4b6608c8e42155db6ecc/LICENSE)
+  contains AGPLv3 text plus an additional commercial-service permission restriction;
+  do not mislabel it ordinary GPL/MIT or import its runtime under this repository's license.
+
+These are mathematical/behavior compatibility references; their Python runtimes are not
+vendored or required for native inference. Pinned source attribution and a review finding
+of no wholesale copied source block are not clean-room certification or legal clearance.
+Model-weight terms remain separate; see [Eros beta5 source and license notes](EROS_BETA5_SETUP.md#來源與授權).
+

@@ -161,3 +161,15 @@ ModelTC repository README 目前主要表格仍列舊 Ref2VA4 v0.1（544p、12/3
 四項負向 CLI 情境均實際拒絕：FL2VA LoRA target 搭 ordered refs、active LoRA 搭 SSD、ordered refs 搭 first-frame anchor、22幀影片搭 soundtrack（不足2秒）。編譯與既有 `h3_lora_tests`、`h3_tests`（1768 checks）、`h3_sampler_tests` 通過。未增加實作／文字比對測試以重複宣稱接線成功。
 
 抽樣檢視0／12／23幀：多圖組可見人物持紅盒；影片組可見連續走路姿態；純音訊組產出公園場景。多圖紅盒在初始幀尚未持在手上，不能宣稱逐幀商品一致性。**沒有主觀聽音／音畫同步評分、運鏡軌跡量測、人物辨識或商品保真度驗證，也未聲稱任意FL2VA風格LoRA都與Ref2VA訓練相容。** 同seed、同畫布但輸入結構與原片幀數不同，耗時僅是逐組單次觀察。
+
+## 2026-10-26：參考圖＋參考聲音＋首圖條件的上游求證
+
+本節為網路第一手文件／程式靜態核對，未執行上游推論，也未改動本機或128G生成程式。結論：**不能從 h3-lora 的互斥檢查推論模型本質上不支援；上游已有 references＋時間定位 keyframe guide 的組合路徑。** 但入口可接、checkpoint品質與逐像素首幀保證是不同層級。
+
+- [MiniMax hosted API V2](https://platform.minimax.io/docs/api-reference/video-generation-v2-create.md) 的 `VideoGenerationV2Req.content` 明文禁止 `reference_image/reference_video/reference_audio` 與 `first_frame/last_frame` 混用。此為託管API契約，不代表所有自架框架都禁止。
+- [官方 Ref2VA prompt guide](https://github.com/MiniMax-AI/MiniMax-H3/blob/35491cdba2adfe62a510f725e8619f8e58783ea2/skills/h3-prompt-writing/references/ref-en.txt) §2.2允許 `<Picture N>` 作首幀／關鍵幀／尾幀，§2.4定義音色參考，§3允許 `keyframe completion` 等任務相加。這證明有語義表達方式，不是固定輸出latent或逐像素相同的保證。
+- [ComfyUI nodes](https://github.com/Comfy-Org/ComfyUI/blob/master/comfy_extras/nodes_minimax_h3.py) 的 `MiniMaxH3ReferenceToVideo` 可建立圖／音 `minimax_refs`，再串 `MiniMaxH3AddGuide(frame_idx=0)` 追加 `minimax_keyframes`；[MiniMaxH3.extra_conds](https://github.com/Comfy-Org/ComfyUI/blob/master/comfy/model_base.py) 與 [PackedLayout](https://github.com/Comfy-Org/ComfyUI/blob/master/comfy/ldm/minimax/model.py) 同時處理兩者。這是實際編碼條件組合，不只是prompt描述。Comfy連結為查核當下移動分支。
+- [SGLang cookbook §2](https://docs.sglang.io/cookbook/diffusion/MiniMax/MiniMax-H3) 明文列出 Ref2VA references 可與首尾keyframes結合；固定revision `ee98bb09b02877ce55bbacd304121dfb7a2692a9` 的 [task_profiles.py](https://github.com/sgl-project/sglang/blob/ee98bb09b02877ce55bbacd304121dfb7a2692a9/python/sglang/multimodal_gen/runtime/pipelines_core/stages/model_specific_stages/minimax_h3/task_profiles.py)、[request_validation.py](https://github.com/sgl-project/sglang/blob/ee98bb09b02877ce55bbacd304121dfb7a2692a9/python/sglang/multimodal_gen/runtime/pipelines_core/stages/model_specific_stages/minimax_h3/request_validation.py) 與 [packed_sequence.py](https://github.com/sgl-project/sglang/blob/ee98bb09b02877ce55bbacd304121dfb7a2692a9/python/sglang/multimodal_gen/runtime/pipelines_core/stages/model_specific_stages/minimax_h3/packed_sequence.py) 有混合驗證與packing實作。profile註解保留「for hybrid checkpoints」限定；不能由接受輸入便宣稱目前官方Ref2VA＋Turbo品質已驗證，也不能把這與必須使用合併權重的 `--model-variant hybrid` 畫等號。
+- 上述guide以獨立固定conditioning rows引導，target rows仍另行去噪；不等於逐步覆寫輸出首幀latent。**目前沒有證據要求先重訓，但也沒有本次實跑證據保證現有Ref2VA／Turbo權重的首圖、人物及聲音遵循品質。**
+
+工程方向：以ComfyUI／SGLang既有混合conditioning作移植依據，修改本機首圖編碼、layout／RoPE、condition rows及快取契約，不能只刪互斥檢查；先驗證現有base，再分開驗證Turbo。無須先假定必須改模型或換權重。

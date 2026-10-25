@@ -2,6 +2,8 @@
 #define H3_CLI_H
 
 #include "h3.h"
+int h3_cli_manifest(const char *path);
+int h3_cli_capabilities(void);
 
 /* Run the interactive prompt. The supplied parameters become session defaults.
  * seed_was_given preserves Iris's random-by-default interactive behavior while

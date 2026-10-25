@@ -3328,6 +3328,46 @@ int h3_gpu_adaln_bf16_offset(h3_gpu *opaque, h3_gpu_tensor *output,
         });
 }
 
+int h3_gpu_adaln_bf16_f32_offset(
+                      h3_gpu *opaque, h3_gpu_tensor *output,
+                      const h3_gpu_tensor *input, size_t input_offset,
+                      const h3_gpu_tensor *norm_weight,
+                      const h3_gpu_tensor *modulation,
+                      const h3_gpu_tensor *row_map, uint32_t rows,
+                      uint32_t width, uint32_t slots, uint32_t shift_slot,
+                      uint32_t scale_slot, float epsilon) {
+    H3GPU *gpu = GPU(opaque);
+    size_t count = (size_t)rows * width;
+    size_t modulation_width = (size_t)slots * width;
+    if (!rows || !width || !slots || shift_slot >= slots || scale_slot >= slots ||
+        !isfinite(epsilon) || epsilon <= 0.0f ||
+        input_offset > SIZE_MAX - count ||
+        input_offset > SIZE_MAX / sizeof(uint16_t)) {
+        h3_gpu_set_error(gpu, @"invalid mixed AdaLN dimensions, epsilon, or input offset");
+        return 0;
+    }
+    if (!h3_gpu_require_bf16(gpu, input, input_offset + count, @"mixed AdaLN input") ||
+        !h3_gpu_require_bf16(gpu, norm_weight, width, @"mixed AdaLN norm") ||
+        !h3_gpu_require_elements(gpu, modulation, modulation_width, @"mixed AdaLN modulation") ||
+        TENSOR(modulation).dtype != H3_GPU_F32 ||
+        TENSOR(modulation).elements % modulation_width ||
+        !h3_gpu_require_elements(gpu, row_map, rows, @"mixed AdaLN row map") ||
+        TENSOR(row_map).dtype != H3_GPU_U32 ||
+        !h3_gpu_require_elements(gpu, output, count, @"mixed AdaLN output") ||
+        TENSOR(output).dtype != H3_GPU_F32) return 0;
+    adaln_args args = {rows, width, slots, shift_slot, scale_slot, epsilon};
+    return h3_gpu_dispatch_rows(gpu, @"h3_adaln_bf16_f32", rows,
+        ^(id<MTLComputeCommandEncoder> encoder) {
+            [encoder setBuffer:TENSOR(input).buffer
+                         offset:input_offset * sizeof(uint16_t) atIndex:0];
+            [encoder setBuffer:TENSOR(norm_weight).buffer offset:0 atIndex:1];
+            [encoder setBuffer:TENSOR(modulation).buffer offset:0 atIndex:2];
+            [encoder setBuffer:TENSOR(row_map).buffer offset:0 atIndex:3];
+            [encoder setBuffer:TENSOR(output).buffer offset:0 atIndex:4];
+            [encoder setBytes:&args length:sizeof(args) atIndex:5];
+        });
+}
+
 int h3_gpu_adaln_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
                       const h3_gpu_tensor *input,
                       const h3_gpu_tensor *norm_weight,

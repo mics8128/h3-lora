@@ -1,4 +1,6 @@
 #include "h3_sampler.h"
+#include "h3_latent.h"
+#include <unistd.h>
 
 #include <math.h>
 #include <stdio.h>
@@ -210,7 +212,268 @@ static void test_one_step_clean(void) {
 }
 
 
+static int zero_velocity(int step, const float *video, const float *audio,
+    float *vv, float *av, void *opaque, char *error, size_t error_size) {
+    (void)step; (void)video; (void)audio; (void)opaque;
+    (void)error; (void)error_size;
+    vv[0]=vv[1]=0;
+    av[0]=av[1]=av[2]=0;
+    return 1;
+}
+
+static void test_soft_mask_single_projection(void) {
+    char error[256];
+    for (int kind=H3_SAMPLER_EULER;kind<=H3_SAMPLER_RES_MULTISTEP;kind++) {
+        h3_sampler_config c={0};c.kind=(h3_sampler_kind)kind;
+        c.video_shift=1;c.audio_shift=1;c.video_count=2;c.audio_count=3;
+        CHECK(h3_schedule_build(1,1,1,&c.schedule));
+        float video[]={0,0},audio[]={0,0,0};
+        float clean_video[]={10,10},clean_audio[]={10,10,10};
+        float video_mask[]={.5f,.5f},audio_mask[]={.5f,.5f,.5f};
+        h3_sampler_state *s=h3_sampler_state_start(&c,video,audio,
+            clean_video,video_mask,clean_audio,audio_mask,error,sizeof(error));
+        CHECK(s);
+        CHECK(h3_sampler_state_run(s,1,zero_velocity,NULL,NULL,NULL,NULL,NULL,error,sizeof(error)));
+        /* Initial zero plus zero velocity proposes zero. A single terminal
+         * 50% preservation projection against clean ten must produce five,
+         * not 7.5 from separately masking the model prediction and proposal. */
+        for (int j=0;j<2;j++)CHECK(h3_sampler_state_video(s)[j]==5);
+        for (int j=0;j<3;j++)CHECK(h3_sampler_state_audio(s)[j]==5);
+        h3_sampler_state_free(s);
+    }
+}
+
+static void test_preservation_trajectory(void) {
+    char error[256];
+    for(int kind=H3_SAMPLER_EULER;kind<=H3_SAMPLER_RES_MULTISTEP;kind++){
+        h3_sampler_config c={0};c.kind=(h3_sampler_kind)kind;
+        c.video_shift=3;c.audio_shift=1;c.video_count=2;c.audio_count=3;
+        c.schedule.steps=2;c.schedule.video[0]=1;c.schedule.video[1]=.5f;
+        c.schedule.audio[0]=1;c.schedule.audio[1]=.25f;
+        float v[]={10,12},a[]={14,16,18},vc[]={2,4},ac[]={6,8,10};
+        float vm[]={0,0},am[]={0,0,0};
+        h3_sampler_state *s=h3_sampler_state_start(&c,v,a,vc,vm,ac,am,error,sizeof(error));
+        CHECK(s);
+        CHECK(h3_sampler_state_video(s)[0]==10&&h3_sampler_state_audio(s)[0]==14);
+        CHECK(h3_sampler_state_run(s,1,native_model,NULL,NULL,NULL,NULL,NULL,error,sizeof(error)));
+        /* Fixed noise remains 10/12 and 14/16/18. Each modality follows its
+         * own sigma: halfway video, one-quarter audio, not a clean clamp. */
+        close_value(h3_sampler_state_video(s)[0],6);
+        close_value(h3_sampler_state_video(s)[1],8);
+        close_value(h3_sampler_state_audio(s)[0],8);
+        close_value(h3_sampler_state_audio(s)[1],10);
+        close_value(h3_sampler_state_audio(s)[2],12);
+        CHECK(h3_sampler_state_run(s,2,native_model,NULL,NULL,NULL,NULL,NULL,error,sizeof(error)));
+        CHECK(!memcmp(h3_sampler_state_video(s),vc,sizeof(vc)));
+        CHECK(!memcmp(h3_sampler_state_audio(s),ac,sizeof(ac)));
+        h3_sampler_state_free(s);
+    }
+}
+
+static void test_state_resume(void) {
+    char error[256], path[128];
+    snprintf(path, sizeof(path), "/tmp/h3-state-%ld.bin", (long)getpid());
+    for (int kind = H3_SAMPLER_EULER; kind <= H3_SAMPLER_ER_SDE; kind++) {
+        for (int start = 0; start <= 2; start += 2) {
+            h3_sampler_config c = {0};
+            c.kind = (h3_sampler_kind)kind; c.video_shift = 12; c.audio_shift = 2;
+            c.video_count = 2; c.audio_count = 3; c.seed = 456; c.start_step = start;
+            c.request_digest[0] = 42;
+            CHECK(h3_schedule_build(6, 12, 2, &c.schedule));
+            CHECK(h3_sampler_schedule_prepare(c.kind,12,2,&c.schedule));
+            float v[] = {.3f, -.7f}, a[] = {.2f, -.4f, .8f};
+            float vc[] = {7, 8}, ac[] = {9, 10, 11};
+            float vm[] = {0, 1}, am[] = {1, 0, .5f};
+            h3_sampler_state *full = h3_sampler_state_start(&c,v,a,vc,vm,ac,am,error,sizeof(error));
+            CHECK(full);
+            CHECK(h3_sampler_state_run(full,6,native_model,NULL,NULL,NULL,NULL,NULL,error,sizeof(error)));
+            for (int split = start; split <= 6; split++) {
+                h3_sampler_state *part = h3_sampler_state_start(&c,v,a,vc,vm,ac,am,error,sizeof(error));
+                CHECK(part);
+                CHECK(h3_sampler_state_run(part,split,native_model,NULL,NULL,NULL,NULL,NULL,error,sizeof(error)));
+                if(split==6){CHECK(h3_sampler_state_video(part)[0] == 7);CHECK(h3_sampler_state_audio(part)[1] == 10);}
+                CHECK(h3_sampler_state_save(part,path,error,sizeof(error)));
+                h3_sampler_state *preview=h3_sampler_state_load_preview(path,error,sizeof(error));
+                CHECK(preview && h3_sampler_state_step(preview)==split);
+                CHECK(!memcmp(h3_sampler_state_video(preview),h3_sampler_state_video(part),2*sizeof(float)));
+                CHECK(!memcmp(h3_sampler_state_audio(preview),h3_sampler_state_audio(part),3*sizeof(float)));
+                CHECK(!h3_sampler_state_run(preview,6,native_model,NULL,NULL,NULL,NULL,NULL,error,sizeof(error)));
+                CHECK(!h3_sampler_state_save(preview,path,error,sizeof(error)));
+                h3_sampler_state_free(preview);
+                CHECK(!h3_sampler_state_load(path,NULL,error,sizeof(error)));
+                h3_sampler_state_free(part);
+                if(c.kind==H3_SAMPLER_ER_SDE) {
+                    void *payload=NULL;size_t bytes=0;
+                    CHECK(h3_native_read(path,4,&payload,&bytes,error,sizeof(error)));
+                    CHECK(bytes==136+8*(size_t)(c.schedule.steps+1)+28*(c.video_count+c.audio_count));
+                    uint64_t *header=payload;CHECK(header[10]==1);
+                    header[10]=0;
+                    CHECK(h3_native_write(path,4,payload,bytes,error,sizeof(error)));
+                    CHECK(!h3_sampler_state_load(path,&c,error,sizeof(error)));
+                    CHECK(!h3_sampler_state_load_preview(path,error,sizeof(error)));
+                    header[10]=2;
+                    CHECK(h3_native_write(path,4,payload,bytes,error,sizeof(error)));
+                    CHECK(!h3_sampler_state_load(path,&c,error,sizeof(error)));
+                    header[10]=1;
+                    CHECK(h3_native_write(path,4,payload,bytes-4,error,sizeof(error)));
+                    CHECK(!h3_sampler_state_load(path,&c,error,sizeof(error)));
+                    CHECK(h3_native_write(path,4,payload,bytes,error,sizeof(error)));
+                    free(payload);
+                }
+                part = h3_sampler_state_load(path,&c,error,sizeof(error));
+                CHECK(part && h3_sampler_state_step(part) == split);
+                CHECK(h3_sampler_state_run(part,6,native_model,NULL,NULL,NULL,NULL,NULL,error,sizeof(error)));
+                CHECK(!memcmp(h3_sampler_state_video(part),h3_sampler_state_video(full),2*sizeof(float)));
+                CHECK(!memcmp(h3_sampler_state_audio(part),h3_sampler_state_audio(full),3*sizeof(float)));
+                h3_sampler_state_free(part);
+                c.request_digest[1]++;
+                CHECK(!h3_sampler_state_load(path,&c,error,sizeof(error)));
+                c.request_digest[1]--;
+                c.seed++;
+                CHECK(!h3_sampler_state_load(path,&c,error,sizeof(error)));
+                c.seed--;
+                c.schedule.audio[1] *= .99f;
+                CHECK(!h3_sampler_state_load(path,&c,error,sizeof(error)));
+                CHECK(h3_schedule_build(6,12,2,&c.schedule));
+                CHECK(h3_sampler_schedule_prepare(c.kind,12,2,&c.schedule));
+                FILE *f = fopen(path,"wb"); CHECK(f); CHECK(fwrite("H3NATIVE",1,8,f)==8); CHECK(!fclose(f));
+                CHECK(!h3_sampler_state_load(path,&c,error,sizeof(error)));
+                CHECK(!h3_sampler_state_load_preview(path,error,sizeof(error)));
+            }
+            vm[1] = 1.01f;
+            CHECK(!h3_sampler_state_start(&c,v,a,vc,vm,ac,am,error,sizeof(error)));
+            vm[1] = NAN;
+            CHECK(!h3_sampler_state_start(&c,v,a,vc,vm,ac,am,error,sizeof(error)));
+            h3_sampler_state_free(full);
+        }
+    }
+    unlink(path);
+}
+
+static void test_native_latent_file(void) {
+    char error[256], path[128];
+    snprintf(path,sizeof(path),"/tmp/h3-latent-%ld.bin",(long)getpid());
+    float v[168] = {1,2}, a[64] = {3,4,5};
+    h3_latent input = {7,1,1,1,168,64,v,a,22,H3_LATENT_TEMPORAL_ENCODER_LINEAR_ENDPOINTS}, output = {0};
+    CHECK(h3_latent_save(path,&input,error,sizeof(error)));
+    CHECK(h3_latent_load(path,&output,error,sizeof(error)));
+    CHECK(output.video_count == 168 && output.audio_count == 64);
+    CHECK(output.source_frames==22 && output.temporal_mapping==1);
+    CHECK(!memcmp(v,output.video,sizeof(v)) && !memcmp(a,output.audio,sizeof(a)));
+    h3_latent_free(&output);
+    /* Shape remains internally valid but provenance must not claim that a
+     * six-step raw encoder latent is a seven-step generated-cadence latent. */
+    input.video_frames=6; input.video_count=144;
+    CHECK(!h3_latent_save(path,&input,error,sizeof(error)));
+    input.video_frames=7; input.video_count=168;
+    input.source_frames=5;
+    CHECK(!h3_latent_save(path,&input,error,sizeof(error)));
+    input.source_frames=0;
+    CHECK(!h3_latent_save(path,&input,error,sizeof(error)));
+    input.source_frames=22; input.temporal_mapping=H3_LATENT_TEMPORAL_NATIVE;
+    CHECK(h3_latent_save(path,&input,error,sizeof(error)));
+    input.source_frames=5;
+    CHECK(!h3_latent_save(path,&input,error,sizeof(error)));
+    input.source_frames=22; input.temporal_mapping=H3_LATENT_TEMPORAL_ENCODER_LINEAR_ENDPOINTS;
+    input.height = 0;
+    CHECK(!h3_latent_save(path,&input,error,sizeof(error)));
+    input.height = 1; v[0] = INFINITY;
+    CHECK(!h3_latent_save(path,&input,error,sizeof(error)));
+    FILE *f = fopen(path,"r+b"); CHECK(f); CHECK(!fseek(f,-1,SEEK_END)); CHECK(fputc(255,f)!=EOF); CHECK(!fclose(f));
+    CHECK(!h3_latent_load(path,&output,error,sizeof(error)));
+    v[0] = 1;
+    input.video_count = 23;
+    CHECK(!h3_latent_save(path,&input,error,sizeof(error)));
+    input.video_count = 0; input.video_frames = input.height = input.width = 0;
+    input.source_frames=0; input.temporal_mapping=0;
+    input.video = NULL;
+    CHECK(h3_latent_save(path,&input,error,sizeof(error)));
+    CHECK(h3_latent_load(path,&output,error,sizeof(error)));
+    CHECK(output.video_count == 0 && output.video == NULL && output.audio_count == 64);
+    h3_latent_free(&output);
+    unlink(path);
+}
+
+/* Literal scalar reference vectors from ComfyUI sample_er_sde (revision
+ * fe298e4e20f1ff26d30e8639267bbd0b57811390), CONST, max_stage=3,
+ * default phi and 200 left nodes, evaluated independently in double.
+ * Deliberately nonuniform sigmas and changing predictions exercise both
+ * clean-prediction and derivative history, not just constant-model Euler. */
+static const float er_predictions[4][2]={{.2f,.5f},{.7f,-.1f},{-.2f,.8f},{.4f,.3f}};
+static int er_reference_model(int step,const float *v,const float *a,
+    float *dv,float *da,void *opaque,char *error,size_t size) {
+    (void)error;(void)size;
+    const float sigmas[]={.9f,.65f,.35f,.1f};
+    dv[0]=(er_predictions[step][0]-v[0])/sigmas[step];
+    const h3_sampler_config *c=opaque;
+    da[0]=(er_predictions[step][1]-a[0])/(c?c->schedule.audio[step]:sigmas[step]);
+    return 1;
+}
+static int er_reference_noise(int step,int audio,float *out,size_t count,
+    void *opaque,char *error,size_t size) {
+    (void)error;(void)size;
+    CHECK(count==1);CHECK(step<3);
+    out[0]=opaque ? 0 : (audio?-.3f:.1f)*(float)(step+1);
+    return 1;
+}
+static void test_er_reference_vectors(void) {
+    const long double expected[4][2]={
+        {.269422328631120L,-.3720183848322928L},
+        {.5248428050446213L,-.3503557219110296L},
+        {-.1567120019773084L,.6195909599545141L},{.4L,.3L}};
+    h3_sampler_config c={0};c.kind=H3_SAMPLER_ER_SDE;
+    c.video_shift=c.audio_shift=1;c.video_count=c.audio_count=1;c.schedule.steps=4;
+    float grid[]={.9f,.65f,.35f,.1f,0};
+    memcpy(c.schedule.video,grid,sizeof(grid));memcpy(c.schedule.audio,grid,sizeof(grid));
+    float video=.3f,audio=-.7f;char error[256],path[128];
+    h3_sampler_state *s=h3_sampler_state_start(&c,&video,&audio,NULL,NULL,NULL,NULL,error,sizeof(error));
+    CHECK(s);
+    for(int stop=1;stop<=4;stop++) {
+        CHECK(h3_sampler_state_run(s,stop,er_reference_model,NULL,er_reference_noise,NULL,NULL,NULL,error,sizeof(error)));
+        close_value(h3_sampler_state_video(s)[0],expected[stop-1][0]);
+        close_value(h3_sampler_state_audio(s)[0],expected[stop-1][1]);
+    }
+    snprintf(path,sizeof(path),"/tmp/h3-er-external-%ld.bin",(long)getpid());
+    CHECK(!h3_sampler_state_save(s,path,error,sizeof(error)));
+    h3_sampler_state_free(s);
+    const long double zero_noise[4][2]={
+        {.22944005911188503L,-.25207157627458776L},
+        {.4778990847093809L,-.2095245609053084L},
+        {-.17883597024687342L,.685962864763209L},{.4L,.3L}};
+    s=h3_sampler_state_start(&c,&video,&audio,NULL,NULL,NULL,NULL,error,sizeof(error));CHECK(s);
+    for(int stop=1;stop<=4;stop++) {
+        CHECK(h3_sampler_state_run(s,stop,er_reference_model,NULL,er_reference_noise,&c,NULL,NULL,error,sizeof(error)));
+        close_value(h3_sampler_state_video(s)[0],zero_noise[stop-1][0]);
+        close_value(h3_sampler_state_audio(s)[0],zero_noise[stop-1][1]);
+    }
+    h3_sampler_state_free(s);
+    /* Unequal shifts: upstream solves the single carried pack, with Dhat_a
+     * =3*D_a, then unpacks at each boundary; per-stream ER is not equivalent. */
+    const long double packed_audio[]={-.0933419383369925L,-.17964301448040268L,
+        .7457812398367875L,.3L};
+    c.video_shift=3;
+    for(int i=0;i<=4;i++)c.schedule.audio[i]=grid[i]/(3-2*grid[i]);
+    s=h3_sampler_state_start(&c,&video,&audio,NULL,NULL,NULL,NULL,error,sizeof(error));CHECK(s);
+    for(int stop=1;stop<=4;stop++) {
+        CHECK(h3_sampler_state_run(s,stop,er_reference_model,&c,er_reference_noise,NULL,NULL,NULL,error,sizeof(error)));
+        close_value(h3_sampler_state_video(s)[0],expected[stop-1][0]);
+        close_value(h3_sampler_state_audio(s)[0],packed_audio[stop-1]);
+    }
+    h3_sampler_state_free(s);
+    CHECK(h3_schedule_build(4,12,3,&c.schedule));
+    CHECK(!h3_sampler_state_start(&c,&video,&audio,NULL,NULL,NULL,NULL,error,sizeof(error)));
+    CHECK(h3_sampler_schedule_prepare(c.kind,12,3,&c.schedule));
+    CHECK(c.schedule.video[0]<1 && c.schedule.audio[0]<1);
+    close_value(c.schedule.video[0],12.L*.9999L/(1+11.L*.9999L));
+    close_value(c.schedule.audio[0],3.L*.9999L/(1+2.L*.9999L));
+}
+
 int main(void) {
+    test_soft_mask_single_projection();
+    test_preservation_trajectory();
+    test_state_resume();
+    test_native_latent_file();
+    test_er_reference_vectors();
     const int steps[] = {1, 4, 5, 6, 8};
     const float shifts[][2] = {{12, 3}, {12, 2}, {6, 3}};
     test_res_worked_example();

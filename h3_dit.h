@@ -6,6 +6,7 @@
 #include "h3_host.h"
 #include "h3_text_encoder.h"
 #include "h3_lora.h"
+#include "h3_sampler.h"
 
 #include <stddef.h>
 #include <stdint.h>
@@ -138,6 +139,15 @@ int h3_dit_denoise_euler_preview(
                          h3_dit_progress progress, void *progress_opaque,
                          h3_dit_preview preview, void *preview_opaque,
                          char *error, size_t error_size);
+
+/* Controlled, synchronized transitions for editing and exact checkpoint resume.
+ * The state owns native AV arrays and complete solver history. Approximate
+ * core reuse/token reduction are rejected rather than silently reset. */
+int h3_dit_denoise_state(h3_dit *dit, h3_sampler_state *state, int stop_step,
+    h3_dit_progress progress, void *progress_opaque,
+    h3_dit_preview preview, void *preview_opaque,
+    h3_sampler_observe transition, void *transition_opaque,
+    char *error, size_t error_size);
 
 /* Build the velocity-evaluation mask used by the serving sampler. Returns the
  * evaluation count, or -1 for invalid arguments. Public internally so the

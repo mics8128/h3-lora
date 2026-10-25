@@ -19,6 +19,10 @@ typedef struct h3_dit_schedule h3_dit_schedule;
 typedef void (*h3_dit_schedule_progress)(int completed_blocks,
                                          int total_blocks, void *opaque);
 
+/* Curve coordinates remain F32; no SiLU is applied in curve-form models. */
+int h3_dit_curve_interpolate(const float *table, uint32_t rows,
+                              uint32_t width, float time, float *output);
+
 /* Materialize every per-step AdaLN value. This intentionally submits one
  * projection at a time, so a 498 MiB block projection is released before the
  * next is loaded. */
@@ -44,7 +48,10 @@ double h3_dit_schedule_gate_score(const h3_dit_schedule *schedule,
                                   unsigned block);
 void h3_dit_schedule_prune(h3_dit_schedule *schedule,
                            const uint8_t *active_blocks, size_t count);
+/* Final modulation is F32 for curve-form checkpoints, BF16 for full-width.
+ * Consumers must inspect the tensor dtype before modulation. */
 const h3_gpu_tensor *h3_dit_schedule_final(const h3_dit_schedule *schedule);
+int h3_dit_schedule_final_is_f32(const h3_dit_schedule *schedule);
 
 /* Build the row map consumed by the fused AdaLN/gate kernels. text_tags may be
  * NULL (all tag 1), or one tag per text row. Qwen vision presentation spans use

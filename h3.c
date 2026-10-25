@@ -13,6 +13,9 @@
 #include "h3_vision_encoder.h"
 #include "h3_lora.h"
 #include "h3_weights.h"
+#include "h3_sampler.h"
+#include "h3_latent.h"
+#include <CommonCrypto/CommonDigest.h>
 
 #include <errno.h>
 #include <math.h>
@@ -21,8 +24,16 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <unistd.h>
+#include <dirent.h>
+#include <ctype.h>
+#include <fcntl.h>
+#include <mach-o/dyld.h>
 
 static char h3_global_error[512];
+static char h3_global_error_code[64];
+static char h3_global_error_field[128];
+static h3_result *h3_decode_latent_output(h3_ctx *,const char *,int,const h3_params *,int,int);
 
 typedef struct {
     char *text;
@@ -38,6 +49,9 @@ static void h3_conditioning_cache_clear(h3_ctx *ctx) {
     free(ctx->conditioning_video_rows);
     free(ctx->conditioning_audio_rows);
     free(ctx->conditioning_references);
+    free(ctx->conditioning_guides);
+    ctx->conditioning_guides = NULL;
+    ctx->conditioning_guide_count = 0;
     ctx->conditioning_key = NULL;
     ctx->conditioning_values = NULL;
     ctx->conditioning_tags = NULL;
@@ -142,13 +156,83 @@ static int h3_key_file(h3_key *key, const char *role, const char *path) {
                          status.st_mtimespec.tv_nsec);
 }
 
-static char *h3_conditioning_key(const char *prompt, const h3_params *params,
-                                 int render_width, int render_height,
-                                 int ref2va) {
+static int h3_key_model_tree(h3_key *key,const char *path,int depth) {
+    struct stat st;
+    if (depth>32 || stat(path,&st)!=0) return h3_key_file(key,"model",path);
+    if (!S_ISDIR(st.st_mode)) return h3_key_file(key,"model",path);
+    struct dirent **entries=NULL; int n=scandir(path,&entries,NULL,alphasort);
+    if(n<0)return 0;
+    int ok=1;
+    for(int i=0;i<n;i++) {
+        if(ok && strcmp(entries[i]->d_name,".") && strcmp(entries[i]->d_name,"..")) {
+            size_t len=strlen(path)+strlen(entries[i]->d_name)+2;char *child=malloc(len);
+            if(!child)ok=0;
+            else {snprintf(child,len,"%s/%s",path,entries[i]->d_name);
+                ok=h3_key_model_tree(key,child,depth+1);free(child);}
+        }
+        free(entries[i]);
+    }
+    free(entries);return ok;
+}
+
+/* Hash the linked executable, not this translation unit's compile timestamp:
+ * an incremental rebuild may replace the sampler/DiT without rebuilding h3.o. */
+static int h3_key_executable(h3_key *key) {
+    char local[1024];
+    char *path=local;
+    uint32_t size=(uint32_t)sizeof(local);
+    if(_NSGetExecutablePath(local,&size)!=0) {
+        path=malloc(size);
+        if(!path)return 0;
+        if(_NSGetExecutablePath(path,&size)!=0) {free(path);return 0;}
+    }
+    int fd=open(path,O_RDONLY|O_CLOEXEC);
+    if(path!=local)free(path);
+    if(fd<0)return 0;
+    CC_SHA256_CTX hash;
+    CC_SHA256_Init(&hash);
+    unsigned char buffer[65536],digest[CC_SHA256_DIGEST_LENGTH];
+    int ok=1;
+    for(;;) {
+        ssize_t count=read(fd,buffer,sizeof(buffer));
+        if(count<0 && errno==EINTR)continue;
+        if(count<0) {ok=0;break;}
+        if(!count)break;
+        CC_SHA256_Update(&hash,buffer,(CC_LONG)count);
+    }
+    close(fd);
+    if(!ok)return 0;
+    CC_SHA256_Final(digest,&hash);
+    static const char digits[]="0123456789abcdef";
+    char hex[CC_SHA256_DIGEST_LENGTH*2+1];
+    for(size_t i=0;i<sizeof(digest);i++) {
+        hex[2*i]=digits[digest[i]>>4];hex[2*i+1]=digits[digest[i]&15];
+    }
+    hex[sizeof(hex)-1]=0;
+    return h3_key_append(key,"|executable-sha256=%s",hex);
+}
+
+static int h3_compare_strings(const void *a,const void *b) {
+    return strcmp(*(const char *const *)a,*(const char *const *)b);
+}
+static int h3_key_environment(h3_key *key) {
+    extern char **environ;size_t count=0;
+    for(char **p=environ;*p;p++) if(!strncmp(*p,"H3_",3) && strncmp(*p,"H3_PROFILE=",11))count++;
+    const char **items=count ? malloc(count*sizeof(*items)) : NULL;
+    if(count && !items)return 0;
+    size_t i=0;for(char **p=environ;*p;p++)if(!strncmp(*p,"H3_",3) && strncmp(*p,"H3_PROFILE=",11))items[i++]=*p;
+    if(count>1)qsort(items,count,sizeof(*items),h3_compare_strings);
+    int ok=1;for(i=0;i<count && ok;i++)ok=h3_key_append(key,"|env=%s",items[i]);
+    free(items);return ok;
+}
+
+static char *h3_conditioning_key(const char *model_identity,const char *prompt, const h3_params *params,
+                                 int render_width, int render_height, int ref2va) {
     h3_key key = {0};
     if (!h3_key_append(&key, "mode=%d|prompt=%zu:%s", ref2va,
                        strlen(prompt), prompt)) goto failed;
-    if (!ref2va && !params->first_frame && !params->last_frame) return key.text;
+    if (!h3_key_append(&key,"|models=%s",model_identity)) goto failed;
+    if (!ref2va && !params->first_frame && !params->last_frame && !params->guide_count) return key.text;
     if (!h3_key_append(&key, "|render=%dx%d|frames=%d|image-size=%d",
                        render_width, render_height, params->frames,
                        params->reference_image_size) ||
@@ -160,6 +244,13 @@ static char *h3_conditioning_key(const char *prompt, const h3_params *params,
                            reference->include_embedded_audio) ||
             !h3_key_file(&key, "media", reference->path) ||
             !h3_key_file(&key, "audio", reference->audio_path)) goto failed;
+    }
+    for (size_t i = 0; i < params->guide_count; i++) {
+        const h3_guide *g = &params->guides[i];
+        if (!h3_key_append(&key,"|guide=%d:%d:%d:%d:%d",g->kind,g->frame_index,
+                g->source_start_frame,g->source_frames,g->include_embedded_audio) ||
+            !h3_key_file(&key,"guide-media",g->path) ||
+            !h3_key_file(&key,"guide-audio",g->audio_path)) goto failed;
     }
     return key.text;
 failed:
@@ -217,7 +308,7 @@ static char *h3_prepared_key(const h3_ctx *ctx, const char *conditioning,
 }
 
 static char *h3_resident_key(const h3_ctx *ctx, const h3_params *params,
-                             int ref2va) {
+                             int ref2va,const char *model_identity) {
     /* Keep one precision/adapter identity convention. Only request-dependent
      * fields are normalized; actual sequence-policy compatibility is checked
      * after the new packed layout has been built. */
@@ -228,7 +319,9 @@ static char *h3_resident_key(const h3_ctx *ctx, const h3_params *params,
     resident.scheduler = H3_SCHEDULER_SERVING;
     resident.video_shift = 12.0f;
     resident.audio_shift = 3.0f;
-    return h3_prepared_key(ctx, ref2va ? "ref2va" : "fl2va", &resident, 0, 0);
+    h3_key key={0};
+    if(!h3_key_append(&key,"%s|%s",ref2va ? "ref2va" : "fl2va",model_identity)) {free(key.text);return NULL;}
+    char *result=h3_prepared_key(ctx,key.text,&resident,0,0);free(key.text);return result;
 }
 
 static int h3_text_embedding_copy(h3_text_embedding *destination,
@@ -356,46 +449,21 @@ static void h3_augment_span(float *values, size_t count, uint64_t seed) {
                         0.001f * h3_rng_normal(&rng);
 }
 
-static int h3_augment_conditions(const h3_params *params, int ref2va,
-                                 int render_width, int render_height,
-                                 const h3_layout_ref *references,
-                                 float *video, size_t video_elements,
-                                 float *audio, size_t audio_elements) {
-    size_t video_offset = 0;
-    size_t audio_offset = 0;
-    if (!ref2va) {
-        int latent_w, latent_h;
-        h3_latent_canvas(render_width, render_height, &latent_w, &latent_h);
-        size_t span = (size_t)h3_video_encoder_latent_t(1) *
-                      (size_t)latent_h * (size_t)latent_w / 4 * 96;
-        size_t count = (size_t)(params->first_frame != NULL) +
-                       (size_t)(params->last_frame != NULL);
-        if (count && (span > SIZE_MAX / count || span * count != video_elements))
-            return 0;
-        for (size_t index = 0; index < count; index++) {
-            h3_augment_span(video + video_offset, span, params->seed);
-            video_offset += span;
-        }
-        return video_offset == video_elements && audio_elements == 0;
+static void h3_augment_conditions(const h3_params *params,
+    const h3_layout_ref *references, const h3_layout_guide *guides, size_t guide_count,
+    float *video) {
+    size_t vo=0;
+    for (size_t i=0;i<params->reference_count;i++) {
+        const h3_layout_ref *r=&references[i];
+        size_t nv=(size_t)r->latent_t*r->latent_h*r->latent_w/4*96;
+        if (nv) h3_augment_span(video+vo,nv,params->seed);
+        vo+=nv;
     }
-    for (size_t index = 0; index < params->reference_count; index++) {
-        const h3_layout_ref *reference = &references[index];
-        if (reference->kind != H3_LAYOUT_REF_AUDIO) {
-            size_t span = (size_t)reference->latent_t *
-                (size_t)reference->latent_h * (size_t)reference->latent_w /
-                4 * 96;
-            if (span > video_elements - video_offset) return 0;
-            h3_augment_span(video + video_offset, span, params->seed);
-            video_offset += span;
-        }
-        if (reference->audio_t) {
-            size_t span = (size_t)reference->audio_t * 2 * 32;
-            if (span > audio_elements - audio_offset) return 0;
-            h3_augment_span(audio + audio_offset, span, params->seed + 1);
-            audio_offset += span;
-        }
+    for (size_t i=0;i<guide_count;i++) {
+        const h3_layout_guide *g=&guides[i];
+        size_t nv=(size_t)g->latent_t*g->latent_h*g->latent_w/4*96;
+        if (nv) h3_augment_span(video+g->video_offset*96,nv,params->seed);
     }
-    return video_offset == video_elements && audio_offset == audio_elements;
 }
 
 void h3_set_error(h3_ctx *ctx, const char *format, ...) {
@@ -404,6 +472,31 @@ void h3_set_error(h3_ctx *ctx, const char *format, ...) {
     va_start(arguments, format);
     vsnprintf(destination, 512, format, arguments);
     va_end(arguments);
+    char *code=ctx ? ctx->error_code : h3_global_error_code;
+    char *field=ctx ? ctx->error_field : h3_global_error_field;
+    snprintf(code,64,"engine_failed"); field[0]=0;
+    static const char *codes[]={"invalid_request","guide_overlap","guide_out_of_range",
+        "missing_model","profile_incompatible","latent_incompatible","checkpoint_incompatible",
+        "dependency_changed","cancelled","output_failed"};
+    for(size_t i=0;i<sizeof(codes)/sizeof(*codes);i++) if(strstr(destination,codes[i])) {
+        snprintf(code,64,"%s",codes[i]); break;
+    }
+    if (!strcmp(code,"engine_failed") && (strstr(destination,"missing required model") || strstr(destination,"require the Ref2VA checkpoint")))
+        snprintf(code,64,"missing_model");
+    const char *guide=strstr(destination,"guides[");
+    if (guide) {
+        const char *end=strchr(guide,']');
+        if(end) {
+            end++;
+            if(*end=='.') {end++;while(isalnum((unsigned char)*end) || *end=='_')end++;}
+            if(end-guide<128)snprintf(field,128,"%.*s",(int)(end-guide),guide);
+        }
+    }
+    if(!*field && strstr(destination,"params.first_frame"))snprintf(field,128,"params.first_frame");
+    if(!*field && strstr(destination,"params.last_frame"))snprintf(field,128,"params.last_frame");
+    if(!*field && strstr(destination,"mask"))snprintf(field,128,"params.mask_path");
+    if(!*field && strstr(destination,"initial AV"))snprintf(field,128,"params.initial_latent_path");
+    if(!*field && !strcmp(code,"checkpoint_incompatible"))snprintf(field,128,"params.resume_path");
 }
 
 static int h3_is_file(const char *path) {
@@ -430,7 +523,7 @@ static int h3_require_file(h3_ctx *ctx, const char *relative) {
     return exists;
 }
 
-static int h3_inventory(h3_ctx *ctx, const char *relative,
+static int h3_inventory(h3_ctx *ctx, const char *relative, int optional,
                         h3_component_info *info) {
     char *path = h3_path(ctx->model_dir, relative);
     if (!path) {
@@ -438,7 +531,9 @@ static int h3_inventory(h3_ctx *ctx, const char *relative,
         return 0;
     }
     char detail[384];
-    int ok = h3_st_inventory_dir(path, info, detail, sizeof(detail));
+    int ok = optional ?
+        h3_st_inventory_dir_optional(path, info, detail, sizeof(detail)) :
+        h3_st_inventory_dir(path, info, detail, sizeof(detail));
     if (!ok) h3_set_error(ctx, "%s", detail);
     free(path);
     return ok;
@@ -447,6 +542,7 @@ static int h3_inventory(h3_ctx *ctx, const char *relative,
 h3_ctx *h3_load_dir(const char *model_dir, const h3_lora_spec *loras,
                     size_t lora_count, h3_lora_model target) {
     h3_global_error[0] = '\0';
+    h3_global_error_code[0]=0;h3_global_error_field[0]=0;
     if (target != H3_LORA_FL2VA && target != H3_LORA_REF2VA) {
         h3_set_error(NULL, "invalid LoRA model target");
         return NULL;
@@ -464,6 +560,7 @@ h3_ctx *h3_load_dir(const char *model_dir, const h3_lora_spec *loras,
         h3_set_error(NULL, "out of memory creating H3 context");
         return NULL;
     }
+    ctx->lora_target=target;
     ctx->model_dir = strdup(model_dir);
     if (!ctx->model_dir) {
         h3_set_error(NULL, "out of memory copying model path");
@@ -472,32 +569,23 @@ h3_ctx *h3_load_dir(const char *model_dir, const h3_lora_spec *loras,
     }
     if (!h3_require_file(ctx, "FL2VA/transformer/config.json") ||
         !h3_require_file(ctx, "FL2VA/tokenizer/tokenizer.json") ||
-        !h3_inventory(ctx, "FL2VA/text_encoder", &ctx->model.text_encoder) ||
-        !h3_inventory(ctx, "FL2VA/transformer", &ctx->model.fl2va_transformer) ||
-        !h3_inventory(ctx, "FL2VA/video_vae/source", &ctx->model.video_vae) ||
-        !h3_inventory(ctx, "FL2VA/audio_vae", &ctx->model.audio_vae)) {
-        snprintf(h3_global_error, sizeof(h3_global_error), "%s", ctx->error);
+        !h3_inventory(ctx, "FL2VA/text_encoder", 0, &ctx->model.text_encoder) ||
+        !h3_inventory(ctx, "FL2VA/transformer", 0, &ctx->model.fl2va_transformer) ||
+        !h3_inventory(ctx, "FL2VA/video_vae/source", 0, &ctx->model.video_vae) ||
+        !h3_inventory(ctx, "FL2VA/audio_vae", 0, &ctx->model.audio_vae)) {
+        h3_set_error(NULL,"%s",ctx->error);
         h3_free(ctx);
         return NULL;
     }
-    /* Ref2VA is selected only by ordered-reference requests. Keep prompt-only
-     * FL2VA usable while that optional 62 GiB checkpoint is not installed. */
-    char *ref_index = h3_path(
-        ctx->model_dir, "Ref2VA/transformer/model.safetensors.index.json");
-    if (!ref_index) {
-        h3_set_error(ctx, "out of memory resolving optional Ref2VA path");
-        snprintf(h3_global_error, sizeof(h3_global_error), "%s", ctx->error);
+    /* Optional references use the same single-file/sharded discovery as FL2VA.
+     * Missing or empty directories must not prevent prompt-only generation. */
+    if (!h3_inventory(ctx, "Ref2VA/transformer", 1,
+                      &ctx->model.ref2va_transformer)) {
+        h3_set_error(NULL,"%s",ctx->error);
         h3_free(ctx);
         return NULL;
     }
-    int has_ref2va = h3_is_file(ref_index);
-    free(ref_index);
-    if (has_ref2va && !h3_inventory(
-            ctx, "Ref2VA/transformer", &ctx->model.ref2va_transformer)) {
-        snprintf(h3_global_error, sizeof(h3_global_error), "%s", ctx->error);
-        h3_free(ctx);
-        return NULL;
-    }
+    int has_ref2va = ctx->model.ref2va_transformer.files != 0;
     int active_loras = 0;
     for (size_t i = 0; i < lora_count; i++) {
         if (!isfinite(loras[i].strength)) {
@@ -534,7 +622,7 @@ h3_ctx *h3_load_dir(const char *model_dir, const h3_lora_spec *loras,
     char metal_error[256];
     if (!h3_metal_probe(&ctx->device, metal_error, sizeof(metal_error))) {
         h3_set_error(ctx, "%s", metal_error);
-        snprintf(h3_global_error, sizeof(h3_global_error), "%s", ctx->error);
+        h3_set_error(NULL,"%s",ctx->error);
         h3_free(ctx);
         return NULL;
     }
@@ -557,6 +645,12 @@ const h3_lora_spec *h3_get_loras(const h3_ctx *ctx, size_t *count) {
 const char *h3_last_error(const h3_ctx *ctx) {
     return ctx ? ctx->error : h3_global_error;
 }
+const char *h3_last_error_code(const h3_ctx *ctx) {
+    return ctx ? ctx->error_code : h3_global_error_code;
+}
+const char *h3_last_error_field(const h3_ctx *ctx) {
+    return ctx ? ctx->error_field : h3_global_error_field;
+}
 
 const h3_device_info *h3_device(const h3_ctx *ctx) {
     return ctx ? &ctx->device : NULL;
@@ -564,6 +658,12 @@ const h3_device_info *h3_device(const h3_ctx *ctx) {
 
 const h3_model_info *h3_model(const h3_ctx *ctx) {
     return ctx ? &ctx->model : NULL;
+}
+
+static int h3_guide_video_span(const h3_guide *guide) {
+    int tokens=h3_video_encoder_latent_t(guide->kind==H3_GUIDE_IMAGE ? 1 : guide->source_frames);
+    /* Sum upstream FRAME_PER_TOKEN=(1,4,4,4,4) over the encoded clip. */
+    return 17*(tokens/5)+(tokens%5 ? 4*(tokens%5)-3 : 0);
 }
 
 static int h3_valid_params(h3_ctx *ctx, const h3_params *params) {
@@ -599,14 +699,14 @@ static int h3_valid_params(h3_ctx *ctx, const h3_params *params) {
             return 0;
         }
     }
-    if (params->frames < 5 || h3_align_frame_count(params->frames) > 362) {
+    if (params->frames < 5 || params->frames > 362 || h3_align_frame_count(params->frames) > 362) {
         h3_set_error(ctx, "frames must align within the released 5..362 range");
         return 0;
     }
     if (params->sampler < H3_SAMPLER_EULER ||
-        params->sampler > H3_SAMPLER_RES_MULTISTEP ||
+        params->sampler > H3_SAMPLER_ER_SDE ||
         params->scheduler < H3_SCHEDULER_SERVING ||
-        params->scheduler > H3_SCHEDULER_SIMPLE ||
+        params->scheduler > H3_SCHEDULER_BETA57 ||
         !isfinite(params->video_shift) || params->video_shift <= 0.0f ||
         !isfinite(params->audio_shift) || params->audio_shift <= 0.0f) {
         h3_set_error(ctx, "invalid sampler, scheduler, or finite positive shifts");
@@ -614,16 +714,16 @@ static int h3_valid_params(h3_ctx *ctx, const h3_params *params) {
     }
     if ((params->scheduler == H3_SCHEDULER_SERVING &&
          params->sampler != H3_SAMPLER_EULER) ||
-        (params->scheduler == H3_SCHEDULER_SIMPLE &&
+        (params->scheduler != H3_SCHEDULER_SERVING &&
          (params->denoise_reuse != 1 || params->core_reuse != 1 ||
           params->token_reduction || params->dit_layers != H3_DEFAULT_DIT_LAYERS ||
           params->render_width || params->render_height))) {
-        h3_set_error(ctx, "serving requires Euler; simple requires full canvas, 50 blocks, no token reduction, reuse/core-reuse 1");
+        h3_set_error(ctx, "serving requires Euler; simple/beta/beta57 require full canvas, 50 blocks, no token reduction, reuse/core-reuse 1");
         return 0;
     }
-    if (params->steps < (params->scheduler == H3_SCHEDULER_SIMPLE ? 1 : 2) ||
+    if (params->steps < (params->scheduler == H3_SCHEDULER_SERVING ? 2 : 1) ||
         params->steps > H3_MAX_STEPS) {
-        h3_set_error(ctx, "denoising steps must be in [2, 1000] for serving or [1, 1000] for simple");
+        h3_set_error(ctx, "denoising steps must be in [2, 1000] for serving or [1, 1000] for simple/beta/beta57");
         return 0;
     }
     if (params->denoise_reuse < 1 || params->denoise_reuse > 3) {
@@ -695,10 +795,62 @@ static int h3_valid_params(h3_ctx *ctx, const h3_params *params) {
         h3_set_error(ctx, "unknown reference image sizing policy");
         return 0;
     }
-    if (params->reference_count && (params->first_frame || params->last_frame)) {
-        h3_set_error(ctx, "full references cannot be combined with frame anchors");
-        return 0;
+    if ((params->guide_count && !params->guides) || params->guide_count > 64) {
+        h3_set_error(ctx, "guides must contain at most 64 descriptors"); return 0;
     }
+    for (size_t i=0; i<params->guide_count; i++) {
+        const h3_guide *g=&params->guides[i];
+        int target=h3_align_frame_count(params->frames);
+        if(g->frame_index<0 || g->frame_index>=target || g->source_frames>target-g->frame_index) {
+            h3_set_error(ctx,"guide_out_of_range: guides[%zu].frame_index does not fit target frames",i);return 0;
+        }
+        if (g->kind < H3_GUIDE_IMAGE || g->kind > H3_GUIDE_CLIP_AUDIO ||
+            !g->path || !*g->path ||
+            g->source_start_frame < 0 || g->source_frames < 0 ||
+            ((g->kind == H3_GUIDE_CLIP || g->kind == H3_GUIDE_CLIP_AUDIO) &&
+             (g->source_frames < 5 || g->source_frames % 17 != 5)) ||
+            (g->kind == H3_GUIDE_IMAGE && (g->source_start_frame || g->source_frames > 1)) ||
+            g->include_embedded_audio<0 || g->include_embedded_audio>1 ||
+            (g->kind!=H3_GUIDE_CLIP_AUDIO &&
+             (g->audio_path || g->include_embedded_audio)) ||
+            (g->kind == H3_GUIDE_CLIP_AUDIO && !g->audio_path && !g->include_embedded_audio)) {
+            h3_set_error(ctx,"invalid_request: guides[%zu] requires resolved placement and explicit valid source span/audio policy",i); return 0;
+        }
+        if(!h3_is_file(g->path) || (g->audio_path && !h3_is_file(g->audio_path))) {
+            h3_set_error(ctx,"invalid_request: guides[%zu] requires readable local media files",i);return 0;
+        }
+        if(g->kind!=H3_GUIDE_AUDIO) {
+            int span=h3_guide_video_span(g),last=h3_align_frame_count(params->frames)-1;
+            if((params->first_frame && g->frame_index==0) ||
+                (params->last_frame && g->frame_index<=last && g->frame_index+span>last)) {
+                h3_set_error(ctx,"guide_overlap: guides[%zu] overlaps an endpoint on the video stream",i);return 0;
+            }
+            for(size_t j=0;j<i;j++) {
+                const h3_guide *previous=&params->guides[j];
+                if(previous->kind!=H3_GUIDE_AUDIO &&
+                    g->frame_index<previous->frame_index+h3_guide_video_span(previous) &&
+                    previous->frame_index<g->frame_index+span) {
+                    h3_set_error(ctx,"guide_overlap: guides[%zu] overlaps guides[%zu] on the video stream",i,j);return 0;
+                }
+            }
+        }
+    }
+    if (params->start_transition < 0 || params->start_transition > params->steps ||
+        (params->start_transition && !params->initial_latent_path && !params->resume_path) ||
+        (params->mask_path && !params->initial_latent_path) ||
+        (params->resume_path && (params->initial_latent_path || params->mask_path))) {
+        h3_set_error(ctx,"latent_incompatible: invalid initial latent, mask, start transition or resume combination"); return 0;
+    }
+    if ((params->initial_latent_path || params->resume_path || params->checkpoint_path || params->on_transition) &&
+        (params->denoise_reuse != 1 || params->core_reuse != 1 || params->token_reduction || params->ssd_streaming ||
+         params->dit_layers != H3_DEFAULT_DIT_LAYERS)) {
+        h3_set_error(ctx,"profile_incompatible: stateful sampling requires uncached exact execution"); return 0;
+    }
+    const char *outputs[]={params->output_path,params->latent_output_path,params->checkpoint_path};
+    for(size_t i=0;i<3;i++)for(size_t j=0;j<i;j++)
+        if(outputs[i] && *outputs[i] && outputs[j] && !strcmp(outputs[i],outputs[j])) {
+            h3_set_error(ctx,"invalid_request: media, latent and checkpoint outputs require distinct paths");return 0;
+        }
     size_t images = 0, videos = 0, audio_inputs = 0;
     for (size_t index = 0; index < params->reference_count; index++) {
         const h3_reference *reference = &params->references[index];
@@ -744,6 +896,16 @@ typedef struct {
     const h3_params *params;
     int cancelled;
 } h3_generation_progress;
+
+typedef struct { const h3_params *params; int total, action; } h3_transition_control;
+static int h3_transition_observe(int completed,const float *video,const float *audio,
+    void *opaque,char *error,size_t error_size) {
+    (void)video;(void)audio;(void)error;(void)error_size;
+    h3_transition_control *control=opaque;
+    control->action=control->params->on_transition ?
+        control->params->on_transition(completed,control->total,control->params->callback_opaque) : 0;
+    return control->action==0;
+}
 
 static void h3_progress_emit(h3_generation_progress *state, const char *phase,
                              int completed, int total) {
@@ -948,33 +1110,113 @@ static float *h3_extract_vision_pair(const float *pixels, int frames,
     return pair;
 }
 
+static int h3_encode_guide(const h3_guide *g, int width, int height, int target_frames,
+    const char *video_path, const char *audio_path, float *prepared_pixels,
+    h3_image_fit fit, h3_layout_guide *out,
+    float **video, size_t *nv, float **audio, size_t *na,
+    char *error, size_t error_size) {
+    memset(out,0,sizeof(*out));
+    out->frame_index=g->frame_index; out->frame_count=1;
+    out->video_offset=*nv/96; out->audio_offset=*na/32;
+    if (g->kind != H3_GUIDE_AUDIO) {
+        float *pixels=prepared_pixels; int frames=1;
+        if (g->kind == H3_GUIDE_IMAGE) {
+            if (!pixels && !h3_ffmpeg_read_image_f32(g->path,width,height,fit,
+                    &pixels,error,error_size)) return 0;
+        } else {
+            frames=g->source_frames;
+            if (!h3_ffmpeg_read_video_range_f32(g->path,width,height,g->source_start_frame,
+                    frames,&pixels,error,error_size)) return 0;
+        }
+        if (g->frame_index < 0 || frames > target_frames-g->frame_index) {
+            free(pixels); snprintf(error,error_size,"guide_out_of_range: visual span"); return 0;
+        }
+        h3_video_latent z={0};
+        int ok=h3_video_vae_encode(video_path,"h3_shaders.metal",pixels,frames,height,width,
+            NULL,NULL,&z,error,error_size); free(pixels); if (!ok) return 0;
+        size_t n=(size_t)24*z.time*z.height*z.width;
+        if (*nv > SIZE_MAX/sizeof(float)-n) { h3_video_latent_free(&z); return 0; }
+        float *p=realloc(*video,(*nv+n)*sizeof(float));
+        if (!p) { h3_video_latent_free(&z); return 0; } *video=p;
+        ok=h3_dit_patchify_video(z.values,24,z.time,z.height,z.width,p+*nv,n);
+        out->latent_t=z.time; out->latent_h=z.height; out->latent_w=z.width;
+        out->frame_count=frames; *nv+=n; h3_video_latent_free(&z); if (!ok) return 0;
+    }
+    if (g->kind == H3_GUIDE_AUDIO || g->kind == H3_GUIDE_CLIP_AUDIO) {
+        const char *path=g->audio_path ? g->audio_path : g->path;
+        int max_t=(int)floor(h3_temporal(target_frames).audio_t-g->frame_index*40.0/24.0);
+        int limit=g->source_frames ? (int)llround(g->source_frames*32000.0/24.0) : max_t*800;
+        if(limit>max_t*800)limit=max_t*800;
+        int64_t skip=(int64_t)llround(g->source_start_frame*32000.0/24.0);
+        if(limit<1) {snprintf(error,error_size,"guide_out_of_range: empty remaining audio");return 0;}
+        float *pcm=NULL; int samples=0;
+        if (!h3_ffmpeg_read_audio_range_f32(path,skip,limit,g->source_frames>0,
+                &pcm,&samples,error,error_size)) return 0;
+        h3_audio_latent z={0}; int ok=h3_audio_vae_encode(audio_path,"h3_shaders.metal",
+            pcm,samples,NULL,NULL,&z,error,error_size); free(pcm); if (!ok) return 0;
+        if (z.length > (int)floor(h3_temporal(target_frames).audio_t-g->frame_index*40.0/24.0)) {
+            h3_audio_latent_free(&z); snprintf(error,error_size,"guide_out_of_range: padded audio span"); return 0;
+        }
+        size_t n=(size_t)64*z.length;
+        if (*na > SIZE_MAX/sizeof(float)-n) { h3_audio_latent_free(&z); return 0; }
+        float *p=realloc(*audio,(*na+n)*sizeof(float));
+        if (!p) { h3_audio_latent_free(&z); return 0; } *audio=p;
+        for (int s=0;s<2;s++) for(int t=0;t<z.length;t++) for(int c=0;c<32;c++)
+            p[*na+((size_t)s*z.length+t)*32+c]=z.values[((size_t)c*2+s)*z.length+t];
+        *na+=n; out->audio_t=z.length; h3_audio_latent_free(&z);
+    }
+    return 1;
+}
+
 h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
                        const h3_params *params) {
     if (!ctx) return NULL;
     ctx->error[0] = '\0';
     if (!prompt || !*prompt) {
-        h3_set_error(ctx, "prompt must not be empty");
+        h3_set_error(ctx, "invalid_request: prompt must not be empty");
         return NULL;
     }
-    if (!h3_valid_params(ctx, params)) return NULL;
-    if (ctx->loras && (params->ssd_streaming ||
-        ((params->reference_count != 0) != (ctx->lora_target == H3_LORA_REF2VA)))) {
+    if (!h3_valid_params(ctx, params)) {
+        if(!strcmp(ctx->error_code,"engine_failed"))snprintf(ctx->error_code,sizeof(ctx->error_code),"invalid_request");
+        return NULL;
+    }
+    h3_sigma_schedule sigmas;
+    int schedule_ok=params->scheduler==H3_SCHEDULER_SERVING ?
+        h3_serving_schedule_build(params->steps,params->video_shift,params->audio_shift,&sigmas) :
+        params->scheduler==H3_SCHEDULER_SIMPLE ?
+        h3_schedule_build(params->steps,params->video_shift,params->audio_shift,&sigmas) :
+        h3_beta_schedule_build(params->steps,params->video_shift,params->audio_shift,
+                               params->scheduler==H3_SCHEDULER_BETA57,&sigmas);
+    if(!schedule_ok || params->start_transition>sigmas.steps) {
+        h3_set_error(ctx,"invalid_request: cannot construct schedule or start exceeds effective transitions");
+        return NULL;
+    }
+    /* Comfy noises the input before ER-SDE applies its first-sigma offset.
+     * In particular full-noise starts must remain full noise, not shrink. */
+    float initial_video_sigma=sigmas.video[params->start_transition];
+    float initial_audio_sigma=sigmas.audio[params->start_transition];
+    if(!h3_sampler_schedule_prepare(params->sampler,params->video_shift,params->audio_shift,&sigmas)) {
+        h3_set_error(ctx,"invalid_request: cannot prepare sampler sigma schedule");return NULL;
+    }
+    int decode_only=params->initial_latent_path && params->start_transition==sigmas.steps;
+    int ref2va = params->reference_count != 0;
+    if (!decode_only && ctx->loras && (params->ssd_streaming ||
+        (ref2va != (ctx->lora_target == H3_LORA_REF2VA)))) {
         h3_set_error(ctx,
-            "active LoRA target must match request mode and cannot use SSD streaming");
+            "profile_incompatible: active LoRA target must match request mode and cannot use SSD streaming");
         return NULL;
     }
     int render_width = params->render_width ? params->render_width :
                                                params->width;
     int render_height = params->render_height ? params->render_height :
                                                  params->height;
-    if (h3_align_frame_count(params->frames) < 22) {
+    if (!decode_only && h3_align_frame_count(params->frames) < 22) {
         h3_set_error(ctx,
             "generation requires at least one trained 22-frame decoder chunk");
         return NULL;
     }
-    int ref2va = params->reference_count != 0;
-    if (ref2va && !ctx->model.ref2va_transformer.files) {
-        h3_set_error(ctx, "ordered references require the Ref2VA checkpoint");
+    if (!decode_only && ref2va && !ctx->model.ref2va_transformer.files) {
+        h3_set_error(ctx, "missing_model: request requires the Ref2VA checkpoint");
         return NULL;
     }
     h3_generation_progress progress = {ctx, params, 0};
@@ -999,8 +1241,9 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     h3_reference_presentation *presentations = NULL;
     double **presentation_timestamps = NULL;
     h3_layout_ref *layout_references = NULL;
-    int keyframes[2] = {0, 0};
-    size_t keyframe_count = 0;
+    h3_layout_guide *layout_guides = NULL;
+    size_t layout_guide_count = params->guide_count +
+        (params->first_frame != NULL) + (params->last_frame != NULL);
     float *condition_video_rows = NULL;
     size_t condition_video_elements = 0;
     float *condition_audio_rows = NULL;
@@ -1014,6 +1257,8 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     h3_live_preview live_preview;
     memset(&live_preview, 0, sizeof(live_preview));
     float *video = NULL, *audio = NULL;
+    h3_sampler_state *sampler_state = NULL;
+    h3_latent initial = {0}, masks = {0};
     h3_video_frames frames;
     memset(&frames, 0, sizeof(frames));
     h3_audio_waveform waveform;
@@ -1024,6 +1269,7 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     char *prepared_key = NULL;
     char *resident_key = NULL;
     char *decoder_key = NULL;
+    char *model_identity=NULL;
     int conditioning_hit = 0;
     int conditioned = 0;
     int dit_is_cached = 0;
@@ -1043,8 +1289,44 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
         h3_set_error(ctx, "out of memory resolving generation model paths");
         goto cleanup;
     }
+    char detail[512]={0};
+    size_t expected_video=(size_t)24*temporal.video_t*latent_h*latent_w;
+    size_t expected_audio=(size_t)64*temporal.audio_t;
+    if (params->initial_latent_path &&
+        (!h3_latent_load(params->initial_latent_path,&initial,detail,sizeof(detail)) ||
+         initial.video_count!=expected_video || initial.audio_count!=expected_audio ||
+         initial.video_frames!=(uint64_t)temporal.video_t || initial.height!=(uint64_t)latent_h ||
+         initial.width!=(uint64_t)latent_w || initial.audio_frames!=(uint64_t)temporal.audio_t)) {
+        h3_set_error(ctx,"latent_incompatible: initial AV shape: %s",detail);goto cleanup;
+    }
+    if (params->mask_path &&
+        (!h3_latent_load(params->mask_path,&masks,detail,sizeof(detail)) ||
+         (masks.video_count && (masks.video_count!=expected_video || masks.video_frames!=(uint64_t)temporal.video_t ||
+             masks.height!=(uint64_t)latent_h || masks.width!=(uint64_t)latent_w)) ||
+         (masks.audio_count && (masks.audio_count!=expected_audio || masks.audio_frames!=(uint64_t)temporal.audio_t)))) {
+        h3_set_error(ctx,"latent_incompatible: mask shape: %s",detail);goto cleanup;
+    }
+    for(size_t i=0;i<masks.video_count;i++) if(masks.video[i]<0 || masks.video[i]>1) {
+        h3_set_error(ctx,"latent_incompatible: video mask must be in [0,1]");goto cleanup;
+    }
+    for(size_t i=0;i<masks.audio_count;i++) if(masks.audio[i]<0 || masks.audio[i]>1) {
+        h3_set_error(ctx,"latent_incompatible: audio mask must be in [0,1]");goto cleanup;
+    }
+    if (decode_only) {
+        if(params->latent_output_path && !h3_latent_save(params->latent_output_path,&initial,detail,sizeof(detail))) {
+            h3_set_error(ctx,"output_failed: latent: %s",detail);goto cleanup;
+        }
+        result=h3_decode_latent_output(ctx,params->initial_latent_path,0,params,
+            params->width,params->height);goto cleanup;
+    }
+    h3_key models={0};
+    if(!h3_key_model_tree(&models,ctx->model_dir,0) ||
+        !h3_key_file(&models,"shader","h3_shaders.metal") || !h3_key_environment(&models)) {
+        free(models.text);h3_set_error(ctx,"out of memory fingerprinting model execution dependencies");goto cleanup;
+    }
+    model_identity=models.text;
     conditioning_key = h3_conditioning_key(
-        prompt, params, render_width, render_height, ref2va);
+        model_identity, prompt, params, render_width, render_height, ref2va);
     if (!conditioning_key) {
         h3_set_error(ctx, "out of memory constructing conditioning cache key");
         goto cleanup;
@@ -1056,7 +1338,7 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
         goto cleanup;
     }
     if (ctx->cache_enabled) {
-        resident_key = h3_resident_key(ctx, params, ref2va);
+        resident_key = h3_resident_key(ctx, params, ref2va,model_identity);
         if (!resident_key) {
             h3_set_error(ctx, "out of memory constructing resident-model cache key");
             goto cleanup;
@@ -1069,8 +1351,9 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
         goto cleanup;
     }
     h3_key decoder_cache_key = {0};
-    if (!h3_key_append(&decoder_cache_key, "%s|%dx%d|%s", vae_path,
-                       latent_h, latent_w, vae_precision)) {
+    if (!h3_key_append(&decoder_cache_key, "%s|%dx%d|%s|%s", vae_path,
+                       latent_h, latent_w, vae_precision,model_identity)) {
+        free(decoder_cache_key.text);
         h3_set_error(ctx, "out of memory constructing decoder cache key");
         goto cleanup;
     }
@@ -1087,7 +1370,6 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
         h3_prepared_cache_clear(ctx);
     conditioning_hit = ctx->cache_enabled && ctx->conditioning_key &&
         !strcmp(ctx->conditioning_key, conditioning_key);
-    char detail[512];
     if (conditioning_hit) {
         size_t cached_reference_count = 0;
         if (!h3_conditioning_cache_load(
@@ -1098,10 +1380,13 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
             h3_set_error(ctx, "cannot restore cached conditioning");
             goto cleanup;
         }
-        if (!ref2va) {
-            if (params->first_frame) keyframes[keyframe_count++] = 0;
-            if (params->last_frame)
-                keyframes[keyframe_count++] = temporal.frame_count - 1;
+        if (ctx->conditioning_guide_count != layout_guide_count) {
+            h3_set_error(ctx,"cached guide descriptor count mismatch"); goto cleanup;
+        }
+        if (layout_guide_count) {
+            layout_guides=malloc(layout_guide_count*sizeof(*layout_guides));
+            if (!layout_guides) { h3_set_error(ctx,"out of memory restoring guides"); goto cleanup; }
+            memcpy(layout_guides,ctx->conditioning_guides,layout_guide_count*sizeof(*layout_guides));
         }
         fprintf(stderr, "h3: conditioning cache hit\n");
     } else {
@@ -1276,6 +1561,9 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
                 h3_set_error(ctx, "%s", detail);
                 goto cleanup;
             }
+            if (samples < 64000) {
+                free(pcm); h3_set_error(ctx,"reference audio requires at least 2 seconds at 32 kHz"); goto cleanup;
+            }
             if ((size_t)samples > (size_t)32000 * 15 - total_audio_samples) {
                 free(pcm);
                 h3_set_error(ctx,
@@ -1341,7 +1629,6 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
         }
     } else {
         if (params->first_frame) {
-            keyframes[keyframe_count++] = 0;
             if (!h3_ffmpeg_read_image_f32(
                     params->first_frame, render_width, render_height,
                     H3_IMAGE_FIT_STRETCH, &condition_pixels[visual_count],
@@ -1355,7 +1642,6 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
             visual_count++;
         }
         if (params->last_frame) {
-            keyframes[keyframe_count++] = temporal.frame_count - 1;
             if (!h3_ffmpeg_read_image_f32(
                     params->last_frame, render_width, render_height,
                     H3_IMAGE_FIT_COVER, &condition_pixels[visual_count],
@@ -1378,8 +1664,8 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
         }
     }
 
-    if (visual_count || ref2va) {
-        for (size_t image = 0; image < visual_count; image++) {
+    if (visual_count || params->reference_count) {
+        for (size_t image = 0; ref2va && image < visual_count; image++) {
             int image_latent_w, image_latent_h;
             h3_latent_canvas(condition_widths[image], condition_heights[image],
                              &image_latent_w, &image_latent_h);
@@ -1406,7 +1692,7 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
             goto cleanup;
         }
         size_t condition_offset = 0;
-        for (size_t image = 0; image < visual_count; image++) {
+        for (size_t image = 0; ref2va && image < visual_count; image++) {
             int image_latent_w, image_latent_h;
             h3_latent_canvas(condition_widths[image], condition_heights[image],
                              &image_latent_w, &image_latent_h);
@@ -1503,8 +1789,7 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
                     if (progress.cancelled) goto cleanup;
                 }
             }
-            free(condition_pixels[image]);
-            condition_pixels[image] = NULL;
+            if (ref2va) { free(condition_pixels[image]); condition_pixels[image]=NULL; }
             if (progress.cancelled) goto cleanup;
         }
         if (vision_cursor != vision_output_count) {
@@ -1544,6 +1829,35 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
         }
     }
     conditioned = visual_count != 0 || condition_audio_elements != 0;
+    if (layout_guide_count) {
+        layout_guides=calloc(layout_guide_count,sizeof(*layout_guides));
+        if (!layout_guides) { h3_set_error(ctx,"out of memory preparing guides"); goto cleanup; }
+        size_t gi=0;
+        const char *endpoints[2]={params->first_frame,params->last_frame};
+        for (int e=0;e<2;e++) if (endpoints[e]) {
+            int frame=e ? temporal.frame_count-1 : 0;
+            h3_guide g={H3_GUIDE_IMAGE,endpoints[e],NULL,frame,0,1,0};
+            float *prepared=!ref2va ? condition_pixels[gi] : NULL;
+            if(!ref2va) condition_pixels[gi]=NULL;
+            if (!h3_encode_guide(&g,render_width,render_height,temporal.frame_count,
+                vae_path,audio_vae_path,prepared,e ? H3_IMAGE_FIT_COVER : H3_IMAGE_FIT_STRETCH,
+                &layout_guides[gi],&condition_video_rows,
+                &condition_video_elements,&condition_audio_rows,&condition_audio_elements,detail,sizeof(detail))) {
+                h3_set_error(ctx,"cannot encode endpoint guide: %s",detail); goto cleanup;
+            }
+            layout_guides[gi].source_index=e ? -2 : -1;
+            gi++;
+        }
+        for (size_t i=0;i<params->guide_count;i++,gi++) {
+            if (!h3_encode_guide(&params->guides[i],render_width,render_height,temporal.frame_count,
+                vae_path,audio_vae_path,NULL,H3_IMAGE_FIT_COVER,&layout_guides[gi],&condition_video_rows,
+                &condition_video_elements,&condition_audio_rows,&condition_audio_elements,detail,sizeof(detail))) {
+                h3_set_error(ctx,"cannot encode guides[%zu]: %s",i,detail); goto cleanup;
+            }
+            layout_guides[gi].source_index=(int)i+1;
+        }
+        conditioned=1;
+    }
     if (ctx->cache_enabled) {
         if (!h3_conditioning_cache_store(
                 ctx, conditioning_key, &text,
@@ -1552,33 +1866,28 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
                 layout_references, ref2va ? params->reference_count : 0,
                 conditioned))
             fprintf(stderr, "h3: warning: could not retain conditioning cache\n");
-        else
+        else {
+            if (layout_guide_count) {
+                ctx->conditioning_guides=malloc(layout_guide_count*sizeof(*layout_guides));
+                if (!ctx->conditioning_guides) h3_conditioning_cache_clear(ctx);
+                else { memcpy(ctx->conditioning_guides,layout_guides,layout_guide_count*sizeof(*layout_guides));
+                    ctx->conditioning_guide_count=layout_guide_count; }
+            }
             fprintf(stderr, "h3: conditioning cache miss; stored exact BF16\n");
+        }
     }
     }
-    if (conditioned && !h3_augment_conditions(
-            params, ref2va, render_width, render_height, layout_references,
-            condition_video_rows, condition_video_elements,
-            condition_audio_rows, condition_audio_elements)) {
-        h3_set_error(ctx, "cannot apply seeded condition augmentation");
-        goto cleanup;
-    }
+    if (conditioned) h3_augment_conditions(params,layout_references,
+        layout_guides,layout_guide_count,condition_video_rows);
     if (progress.cancelled) goto cleanup;
 
     h3_layout_spec spec = {(int)text.tokens, temporal.video_t, latent_h,
                            latent_w, temporal.audio_t, temporal.frame_count,
-                           keyframes, keyframe_count,
+                           layout_guides, layout_guide_count,
                            layout_references,
                            ref2va ? params->reference_count : 0};
     if (!h3_layout_build(&spec, &layout, detail, sizeof(detail))) {
         h3_set_error(ctx, "%s", detail);
-        goto cleanup;
-    }
-    h3_sigma_schedule sigmas;
-    if (!(params->scheduler == H3_SCHEDULER_SIMPLE ?
-          h3_schedule_build(params->steps, params->video_shift, params->audio_shift, &sigmas) :
-          h3_serving_schedule_build(params->steps, params->video_shift, params->audio_shift, &sigmas))) {
-        h3_set_error(ctx, "cannot construct the requested sigma schedule");
         goto cleanup;
     }
     float spatial_rope_scale = !params->use_reference_rope &&
@@ -1724,7 +2033,58 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     h3_rng_seed(&audio_rng, params->seed);
     h3_rng_fill_normal(&video_rng, video, video_count);
     h3_rng_fill_normal(&audio_rng, audio, audio_count);
-    int denoised = params->scheduler == H3_SCHEDULER_SIMPLE ?
+    int controlled=params->initial_latent_path || params->resume_path ||
+        params->checkpoint_path || params->on_transition;
+    int denoised=0;
+    if (controlled) {
+        h3_sampler_config config={0}; config.kind=params->sampler; config.schedule=sigmas;
+        config.video_shift=params->video_shift; config.audio_shift=params->audio_shift;
+        config.seed=params->seed; config.start_step=params->start_transition;
+        config.video_count=video_count; config.audio_count=audio_count;
+        h3_key identity={0};
+        if (!h3_key_append(&identity,"%s|native=%s|build=%s %s|model=%s|digest=%s",prepared_key,
+                H3_VERSION,__DATE__,__TIME__,ctx->model_dir,params->request_digest ? params->request_digest : "")) {
+            free(identity.text); h3_set_error(ctx,"out of memory computing checkpoint identity"); goto cleanup;
+        }
+        if(!h3_key_executable(&identity)) {
+            free(identity.text);
+            h3_set_error(ctx,"dependency_changed: cannot fingerprint the executable for exact checkpoint identity");
+            goto cleanup;
+        }
+        CC_SHA256(identity.text,(CC_LONG)identity.length,config.request_digest); free(identity.text);
+        if (params->initial_latent_path) {
+            float sv=initial_video_sigma, sa=initial_audio_sigma;
+            for (size_t i=0;i<video_count;i++) video[i]=(1-sv)*initial.video[i]+sv*video[i];
+            for (size_t i=0;i<audio_count;i++) audio[i]=(1-sa)*initial.audio[i]+sa*audio[i];
+        }
+        sampler_state=params->resume_path ? h3_sampler_state_load(params->resume_path,&config,detail,sizeof(detail)) :
+            h3_sampler_state_start(&config,video,audio,initial.video,masks.video,initial.audio,masks.audio,detail,sizeof(detail));
+        if (!sampler_state) { h3_set_error(ctx,"checkpoint_incompatible: %s",detail); goto cleanup; }
+        h3_transition_control control={params,sigmas.steps,0};
+        denoised=h3_dit_denoise_state(dit,sampler_state,sigmas.steps,h3_dit_progress_bridge,&progress,
+            preview_decoder ? h3_deliver_denoise_preview : NULL,preview_decoder ? &live_preview : NULL,
+            h3_transition_observe,&control,detail,sizeof(detail));
+        int action=control.action;
+        if(action) denoised=1; /* Observer stopped only after a committed transition. */
+        if (denoised && params->checkpoint_path &&
+            !h3_sampler_state_save(sampler_state,params->checkpoint_path,detail,sizeof(detail))) {
+            h3_set_error(ctx,"output_failed: checkpoint: %s",detail); goto cleanup;
+        }
+        if (denoised && action) {
+            if (action==1 && !params->checkpoint_path) {
+                h3_set_error(ctx,"output_failed: pause requires checkpoint_path"); goto cleanup;
+            }
+            result=calloc(1,sizeof(*result));
+            if (!result) { h3_set_error(ctx,"out of memory creating stopped result"); goto cleanup; }
+            result->status=action==1 ? 1 : 2; result->width=params->width; result->height=params->height;
+            result->frames=temporal.frame_count; result->fps=H3_FPS; result->seed=params->seed;
+            goto cleanup;
+        }
+        if (denoised) {
+            memcpy(video,h3_sampler_state_video(sampler_state),video_count*sizeof(float));
+            memcpy(audio,h3_sampler_state_audio(sampler_state),audio_count*sizeof(float));
+        }
+    } else denoised = params->scheduler != H3_SCHEDULER_SERVING ?
         h3_dit_denoise_simple_preview(
             dit, params->sampler, params->seed, params->video_shift, params->audio_shift,
             video, audio, h3_dit_progress_bridge, &progress,
@@ -1750,6 +2110,15 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     if (!dit_is_cached) h3_dit_free(dit);
     dit = NULL;
     if (progress.cancelled) goto cleanup;
+    if (params->latent_output_path) {
+        h3_latent clean={.video_frames=(uint64_t)temporal.video_t,.height=(uint64_t)latent_h,
+            .width=(uint64_t)latent_w,.audio_frames=(uint64_t)temporal.audio_t,
+            .video_count=video_count,.audio_count=audio_count,.video=video,.audio=audio,
+            .source_frames=(uint64_t)temporal.frame_count,.temporal_mapping=H3_LATENT_TEMPORAL_NATIVE};
+        if (!h3_latent_save(params->latent_output_path,&clean,detail,sizeof(detail))) {
+            h3_set_error(ctx,"output_failed: latent: %s",detail); goto cleanup;
+        }
+    }
     h3_progress_emit(&progress, "audio VAE", 0, 7);
     if (!h3_audio_vae_decode(audio_vae_path, "h3_shaders.metal", audio,
                              temporal.audio_t, h3_audio_vae_progress_bridge,
@@ -1853,6 +2222,7 @@ cleanup:
     free(prepared_key);
     free(resident_key);
     free(decoder_key);
+    free(model_identity);
     free(tokenizer_path); free(text_path); free(dit_path); free(vae_path);
     free(audio_vae_path);
     h3_tokenizer_free(tokenizer);
@@ -1874,6 +2244,9 @@ cleanup:
     free(presentations);
     free(presentation_timestamps);
     free(layout_references);
+    free(layout_guides);
+    h3_sampler_state_free(sampler_state);
+    h3_latent_free(&initial); h3_latent_free(&masks);
     free(condition_video_rows);
     free(condition_audio_rows);
     h3_text_embedding_free(&text);
@@ -1884,6 +2257,192 @@ cleanup:
     h3_video_frames_free(&frames);
     h3_audio_waveform_free(&waveform);
     return result;
+}
+
+h3_result *h3_resume(h3_ctx *ctx,const char *prompt,const h3_params *params) {
+    if (!params || !params->resume_path) { h3_set_error(ctx,"resume requires resume_path"); return NULL; }
+    return h3_generate(ctx,prompt,params);
+}
+
+h3_result *h3_encode_media(h3_ctx *ctx,const char *input,int streams,const h3_params *p) {
+    if (!ctx) return NULL;
+    ctx->error[0]=0;
+    if (!input || !p || streams<1 || streams>3 || !p->latent_output_path) {
+        h3_set_error(ctx,"invalid_request: encode requires input, stream policy and latent_output_path"); return NULL;
+    }
+    if(!h3_valid_params(ctx,p)) {
+        if(!strcmp(ctx->error_code,"engine_failed"))snprintf(ctx->error_code,sizeof(ctx->error_code),"invalid_request");
+        return NULL;
+    }
+    int ref=p->reference_count!=0 || ctx->lora_target==H3_LORA_REF2VA;
+    int width=p->render_width ? p->render_width : p->width;
+    int height=p->render_height ? p->render_height : p->height;
+    char *vp=h3_path(ctx->model_dir,ref ? "Ref2VA/video_vae/source" : "FL2VA/video_vae/source");
+    char *ap=h3_path(ctx->model_dir,ref ? "Ref2VA/audio_vae" : "FL2VA/audio_vae");
+    h3_latent latent={0}; h3_video_latent vz={0}; h3_audio_latent az={0};
+    float *pixels=NULL,*pcm=NULL; int frames=0,samples=0; char error[512]={0}; h3_result *r=NULL;
+    if (!vp || !ap) { h3_set_error(ctx,"out of memory resolving encoder paths"); goto done; }
+    if (streams&1) {
+        if (!h3_ffmpeg_read_video_f32(input,width,height,p->frames,&pixels,&frames,error,sizeof(error)) ||
+            frames!=p->frames || !h3_video_vae_encode(vp,"h3_shaders.metal",pixels,frames,height,width,
+                NULL,NULL,&vz,error,sizeof(error))) { h3_set_error(ctx,"encode video: %s",error); goto done; }
+        int target=h3_video_latent_t(frames); size_t area=(size_t)vz.height*vz.width;
+        latent.video_count=(size_t)24*target*area;
+        latent.video=malloc(latent.video_count*sizeof(float));
+        if (!latent.video) { h3_set_error(ctx,"out of memory mapping video temporal convention"); goto done; }
+        /* Explicit endpoint-aligned linear temporal conversion; never reinterpret encoder T. */
+        for(int c=0;c<24;c++) for(int t=0;t<target;t++) {
+            double at=target>1 ? (double)t*(vz.time-1)/(target-1) : 0;
+            int lo=(int)floor(at),hi=lo+1<vz.time ? lo+1 : lo; float w=(float)(at-lo);
+            for(size_t i=0;i<area;i++) latent.video[((size_t)c*target+t)*area+i]=
+                (1-w)*vz.values[((size_t)c*vz.time+lo)*area+i]+w*vz.values[((size_t)c*vz.time+hi)*area+i];
+        }
+        latent.video_frames=target; latent.height=vz.height; latent.width=vz.width;
+        latent.source_frames=frames; latent.temporal_mapping=1;
+    }
+    if (streams&2) {
+        int limit = streams == 2 ? 32000 * 16 :
+            (int)llround(p->frames * 32000.0 / 24.0);
+        if (!h3_ffmpeg_read_audio_f32(input,limit,streams==3,&pcm,&samples,error,sizeof(error)) ||
+            !h3_audio_vae_encode(ap,"h3_shaders.metal",pcm,samples,NULL,NULL,&az,error,sizeof(error))) {
+            h3_set_error(ctx,"encode audio: %s",error); goto done;
+        }
+        if(streams==3) {
+            int target=h3_temporal(p->frames).audio_t;
+            if(az.length<target || az.length>target+1) {
+                h3_set_error(ctx,"latent_incompatible: audiovisual source audio does not span the target duration");goto done;
+            }
+            /* The encoder right-pads; drop only the final excess padded latent tick. */
+            if(az.length!=target) for(int i=0;i<64;i++) memmove(az.values+(size_t)i*target,
+                az.values+(size_t)i*az.length,(size_t)target*sizeof(float));
+            az.length=target;
+        }
+        latent.audio=az.values; az.values=NULL; latent.audio_frames=az.length;
+        latent.audio_count=(size_t)64*az.length;
+    }
+    if (!h3_latent_save(p->latent_output_path,&latent,error,sizeof(error))) {
+        h3_set_error(ctx,"output_failed: %s",error); goto done;
+    }
+    r=calloc(1,sizeof(*r));
+    if (!r) { h3_set_error(ctx,"out of memory creating encode result"); goto done; }
+    r->width=(streams&1) ? width : 0; r->height=(streams&1) ? height : 0;
+    r->frames=frames; r->fps=24; r->sample_rate=(streams&2) ? 32000 : 0;
+done:
+    free(vp);free(ap);free(pixels);free(pcm);
+    h3_video_latent_free(&vz);h3_audio_latent_free(&az);h3_latent_free(&latent);return r;
+}
+
+static void h3_le16(unsigned char *p,uint16_t x) { p[0]=(unsigned char)x;p[1]=(unsigned char)(x>>8); }
+static void h3_le32(unsigned char *p,uint32_t x) { for(int i=0;i<4;i++)p[i]=(unsigned char)(x>>(8*i)); }
+static int h3_write_wave(const char *path,const h3_audio_waveform *a,char *error,size_t n) {
+    if (a->channels!=2 || a->samples<1 || (uint64_t)a->samples*8>UINT32_MAX-36) {
+        snprintf(error,n,"invalid stereo waveform");return 0;
+    }
+    size_t len=strlen(path)+16;char *temp=malloc(len);
+    if(!temp) {snprintf(error,n,"out of memory creating audio output");return 0;}
+    snprintf(temp,len,"%s.tmp.XXXXXX",path);int fd=mkstemp(temp);
+    if(fd<0) {snprintf(error,n,"cannot create audio output: %s",strerror(errno));free(temp);return 0;}
+    FILE *f=fdopen(fd,"wb");if(!f){close(fd);unlink(temp);free(temp);return 0;}
+    unsigned char h[44]={0};memcpy(h,"RIFF",4);h3_le32(h+4,36+(uint32_t)a->samples*8);
+    memcpy(h+8,"WAVEfmt ",8);h3_le32(h+16,16);h3_le16(h+20,3);h3_le16(h+22,2);
+    h3_le32(h+24,(uint32_t)a->sample_rate);h3_le32(h+28,(uint32_t)a->sample_rate*8);
+    h3_le16(h+32,8);h3_le16(h+34,32);memcpy(h+36,"data",4);h3_le32(h+40,(uint32_t)a->samples*8);
+    int ok=fwrite(h,1,sizeof(h),f)==sizeof(h);
+    unsigned char chunk[4096];
+    for(int start=0;ok && start<a->samples;start+=512) {
+        int count=a->samples-start<512 ? a->samples-start : 512;
+        for(int i=0;i<count;i++) for(int c=0;c<2;c++) {
+            uint32_t bits;memcpy(&bits,a->pcm+(size_t)c*a->samples+start+i,4);
+            h3_le32(chunk+((size_t)i*2+c)*4,bits);
+        }
+        ok=fwrite(chunk,8,(size_t)count,f)==(size_t)count;
+    }
+    if(ok)ok=fflush(f)==0 && fsync(fd)==0;
+    if(fclose(f)!=0)ok=0;
+    if(ok)ok=rename(temp,path)==0;
+    if(!ok){snprintf(error,n,"cannot publish audio output: %s",strerror(errno));unlink(temp);}
+    free(temp);return ok;
+}
+
+static h3_result *h3_decode_latent_output(h3_ctx *ctx,const char *input,int diagnostic,
+    const h3_params *p,int target_width,int target_height) {
+    if (!ctx) return NULL;
+    ctx->error[0]=0;
+    if (!input || !p) { h3_set_error(ctx,"invalid_request: decode requires input and params"); return NULL; }
+    h3_latent latent={0};char error[512]={0}; h3_video_frames frames={0};h3_audio_waveform audio={0};
+    uint8_t *rgb=NULL;h3_result *r=NULL;
+    h3_sampler_state *preview=NULL;
+    int output_width=0,output_height=0;
+    int ref=p->reference_count!=0 || ctx->lora_target==H3_LORA_REF2VA;
+    char *vp=h3_path(ctx->model_dir,ref ? "Ref2VA/video_vae/source" : "FL2VA/video_vae/source");
+    char *ap=h3_path(ctx->model_dir,ref ? "Ref2VA/audio_vae" : "FL2VA/audio_vae");
+    if (!vp || !ap) { h3_set_error(ctx,"out of memory resolving decoder paths");goto done; }
+    if (!h3_latent_load(input,&latent,error,sizeof(error))) {
+        if(!diagnostic || !h3_valid_params(ctx,p)) {
+            if(!ctx->error[0]) h3_set_error(ctx,"latent_incompatible: %s",error);goto done;
+        }
+        preview=h3_sampler_state_load_preview(input,error,sizeof(error));
+        if(!preview) {h3_set_error(ctx,"latent_incompatible: %s",error);goto done;}
+        const h3_sampler_config *config=h3_sampler_state_config(preview);
+        h3_temporal_shape temporal=h3_temporal(p->frames);
+        latent.height=(uint64_t)(p->render_height ? p->render_height : p->height)/16;
+        latent.width=(uint64_t)(p->render_width ? p->render_width : p->width)/16;
+        latent.video_frames=temporal.video_t;latent.audio_frames=temporal.audio_t;
+        latent.video_count=(size_t)24*latent.video_frames*latent.height*latent.width;
+        latent.audio_count=(size_t)64*latent.audio_frames;
+        if(config->video_count!=latent.video_count || config->audio_count!=latent.audio_count) {
+            h3_set_error(ctx,"latent_incompatible: diagnostic checkpoint target shape mismatch");goto done;
+        }
+        latent.video=(float *)h3_sampler_state_video(preview);
+        latent.audio=(float *)h3_sampler_state_audio(preview);
+    }
+    if (latent.audio_count && !h3_audio_vae_decode(ap,"h3_shaders.metal",latent.audio,
+        (int)latent.audio_frames,NULL,NULL,&audio,error,sizeof(error))) {
+        h3_set_error(ctx,"decode audio: %s",error);goto done;
+    }
+    if (latent.video_count) {
+        if (!h3_video_vae_decode(vp,"h3_shaders.metal",latent.video,(int)latent.video_frames,
+            (int)latent.height,(int)latent.width,NULL,NULL,&frames,error,sizeof(error))) {
+            h3_set_error(ctx,"decode video: %s",error);goto done;
+        }
+        rgb=h3_rgb_f32_to_u8(frames.rgb,(size_t)frames.frames*frames.height*frames.width*3);
+        if (!rgb) { h3_set_error(ctx,"out of memory converting decoded frames"); goto done; }
+        output_width=frames.width;output_height=frames.height;
+        if(target_width && (output_width!=target_width || output_height!=target_height)) {
+            uint8_t *resized=NULL;
+            if(!h3_resize_rgb24_high_quality(rgb,frames.frames,output_width,output_height,
+                target_width,target_height,&resized)) {
+                h3_set_error(ctx,"cannot resize terminal generation frames");goto done;
+            }
+            free(rgb);rgb=resized;output_width=target_width;output_height=target_height;
+        }
+        if (p->on_frame) for(int i=0;i<frames.frames;i++) {
+            h3_frame f={output_width,output_height,output_width*3,
+                rgb+(size_t)i*output_width*output_height*3,i,frames.frames,-1,0};
+            if (p->on_frame(&f,p->callback_opaque)) { h3_set_error(ctx,"cancelled: decode frame delivery"); goto done; }
+        }
+    }
+    if (p->output_path) {
+        int ok=!latent.video_count ? h3_write_wave(p->output_path,&audio,error,sizeof(error)) :
+            latent.audio_count ? h3_ffmpeg_write_av_rgb24_f32(p->output_path,rgb,frames.frames,
+            output_width,output_height,24,audio.pcm,audio.samples,audio.channels,audio.sample_rate,error,sizeof(error)) :
+            h3_ffmpeg_write_rgb24(p->output_path,rgb,frames.frames,output_width,output_height,24,error,sizeof(error));
+        if (!ok) { h3_set_error(ctx,"output_failed: %s",error);goto done; }
+    }
+    r=calloc(1,sizeof(*r));
+    if (!r) { h3_set_error(ctx,"out of memory creating decode result");goto done; }
+    r->width=output_width;r->height=output_height;r->frames=frames.frames;r->fps=24;
+    r->sample_rate=audio.sample_rate;r->seed=p->seed;
+    r->diagnostic_preview=preview!=NULL;
+done:
+    if(preview) {latent.video=NULL;latent.audio=NULL;h3_sampler_state_free(preview);}
+    free(vp);free(ap);free(rgb);h3_latent_free(&latent);
+    h3_video_frames_free(&frames);h3_audio_waveform_free(&audio);return r;
+}
+
+h3_result *h3_decode_latent(h3_ctx *ctx,const char *input,int diagnostic,const h3_params *params) {
+    /* Standalone decoding preserves the bundle's native canvas. */
+    return h3_decode_latent_output(ctx,input,diagnostic,params,0,0);
 }
 
 void h3_result_free(h3_result *result) {

@@ -54,9 +54,9 @@ int main(int argc, char **argv) {
         h3_dit_schedule_video_row(schedule, 1) != 1 ||
         h3_dit_schedule_audio_row(schedule, 1) != 2)
         die("unexpected global timestep row layout");
-    int keyframes[] = {0};
+    h3_layout_guide guides[] = {{0,1,1,2,2,0,0,0,0}};
     h3_layout_spec spec = {6, 2, 2, 2, 8, 5,
-                           keyframes, 1, NULL, 0};
+                           guides, 1, NULL, 0};
     h3_layout layout;
     if (!h3_layout_build(&spec, &layout, error, sizeof(error))) die(error);
     uint8_t text_tags[] = {1, 0, 0, 1, 1, 1};

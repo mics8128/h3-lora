@@ -594,17 +594,29 @@ static int h3_has_suffix(const char *value, const char *suffix) {
     return length >= suffix_length && !strcmp(value + length - suffix_length, suffix);
 }
 
-int h3_st_inventory_dir(const char *directory, h3_component_info *info,
-                        char *error, size_t error_size) {
+static int inventory_dir(const char *directory, h3_component_info *info,
+                         int optional, char *error, size_t error_size) {
     if (!directory || !info) return 0;
     memset(info, 0, sizeof(*info));
     DIR *stream = opendir(directory);
     if (!stream) {
+        if (optional && errno == ENOENT) return 1;
         if (error && error_size) snprintf(error, error_size, "%s: %s", directory, strerror(errno));
         return 0;
     }
     struct dirent *entry;
-    while ((entry = readdir(stream)) != NULL) {
+    for (;;) {
+        errno = 0;
+        entry = readdir(stream);
+        if (!entry) {
+            int saved = errno;
+            if (saved) {
+                if (error && error_size) snprintf(error, error_size, "%s: %s", directory, strerror(saved));
+                closedir(stream);
+                return 0;
+            }
+            break;
+        }
         if (entry->d_name[0] == '.' || !h3_has_suffix(entry->d_name, ".safetensors")) continue;
         size_t length = strlen(directory) + strlen(entry->d_name) + 2;
         char *path = malloc(length);
@@ -630,10 +642,23 @@ int h3_st_inventory_dir(const char *directory, h3_component_info *info,
         }
         h3_st_free_header(&header);
     }
-    closedir(stream);
-    if (!info->files) {
+    if (closedir(stream) != 0) {
+        if (error && error_size) snprintf(error, error_size, "%s: %s", directory, strerror(errno));
+        return 0;
+    }
+    if (!info->files && !optional) {
         if (error && error_size) snprintf(error, error_size, "%s: no safetensors files", directory);
         return 0;
     }
     return 1;
+}
+
+int h3_st_inventory_dir(const char *directory, h3_component_info *info,
+                        char *error, size_t error_size) {
+    return inventory_dir(directory, info, 0, error, error_size);
+}
+
+int h3_st_inventory_dir_optional(const char *directory, h3_component_info *info,
+                                 char *error, size_t error_size) {
+    return inventory_dir(directory, info, 1, error, error_size);
 }

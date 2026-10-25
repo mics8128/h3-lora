@@ -28,6 +28,7 @@ typedef struct {
 typedef enum {
     H3_SEG_TEXT,
     H3_SEG_COND,
+    H3_SEG_COND_AUDIO,
     H3_SEG_REF_IMAGE,
     H3_SEG_REF_AUDIO,
     H3_SEG_AUDIO,
@@ -38,6 +39,7 @@ typedef struct {
     size_t start;
     size_t stop;
     h3_segment_kind kind;
+    size_t payload_offset; /* rows in the corresponding condition modality */
 } h3_segment;
 
 typedef enum {
@@ -55,14 +57,25 @@ typedef struct {
 } h3_layout_ref;
 
 typedef struct {
+    int frame_index;
+    int frame_count; /* one for image; encoded source frame count for clip */
+    int latent_t, latent_h, latent_w;
+    int audio_t;
+    size_t video_offset, audio_offset; /* modality rows */
+    /* Positive: caller guide index + 1; zero: descriptor position.
+     * -1/-2 identify lowered first_frame/last_frame conveniences. */
+    int source_index;
+} h3_layout_guide;
+
+typedef struct {
     int text_len;
     int latent_t;
     int latent_h;
     int latent_w;
     int audio_t;
     int frame_count;
-    const int *keyframes;
-    size_t keyframe_count;
+    const h3_layout_guide *guides;
+    size_t guide_count;
     const h3_layout_ref *references;
     size_t reference_count;
 } h3_layout_spec;
@@ -77,6 +90,7 @@ typedef struct {
     size_t audio_cond_rows;
     size_t audio_target_rows;
     int signature[5];
+    double target_origin;
 } h3_layout;
 
 typedef struct {
@@ -113,6 +127,10 @@ double h3_time_shift_sigma(double sigma, double from_shift, double to_shift);
 double h3_time_shift_slope(double sigma, double from_shift, double to_shift);
 int h3_schedule_build(int steps, float video_shift, float audio_shift,
                       h3_sigma_schedule *schedule);
+/* Comfy discrete beta CDF grid; beta57 selects (.5,.7), else (.6,.6).
+ * Rounded duplicate table entries are removed, so steps may shrink. */
+int h3_beta_schedule_build(int steps, float video_shift, float audio_shift,
+                           int beta57, h3_sigma_schedule *schedule);
 /* Released linear base grid: evaluations model forwards plus terminal zero. */
 int h3_serving_schedule_build(int evaluations, float video_shift,
                               float audio_shift, h3_sigma_schedule *schedule);

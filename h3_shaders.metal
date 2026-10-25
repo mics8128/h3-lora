@@ -3079,6 +3079,48 @@ kernel void h3_adaln_bf16(device const ushort *input [[buffer(0)]],
     }
 }
 
+/* Curve final-layer modulation: RMSNorm emits BF16 before F32 scale/shift.
+ * Keep multiply and add separate, as in the primary PyTorch expression. */
+kernel void h3_adaln_bf16_f32(device const ushort *input [[buffer(0)]],
+                              device const ushort *weight [[buffer(1)]],
+                              device const float *modulation [[buffer(2)]],
+                              device const uint *row_map [[buffer(3)]],
+                              device float *output [[buffer(4)]],
+                              constant adaln_args &args [[buffer(5)]],
+                              uint3 group [[threadgroup_position_in_grid]],
+                              uint3 thread_position [[thread_position_in_threadgroup]],
+                              uint3 threadgroup_size [[threads_per_threadgroup]]) {
+    uint row = group.x;
+    uint tid = thread_position.x;
+    uint threads = threadgroup_size.x;
+    if (row >= args.rows) return;
+    threadgroup float reductions[256];
+    device const ushort *x = input + size_t(row) * args.width;
+    float local_sum = 0.0f;
+    for (uint k = tid; k < args.width; k += threads) {
+        float value = h3_bf16_to_f32(x[k]);
+        local_sum = fma(value, value, local_sum);
+    }
+    reductions[tid] = local_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = threads / 2; stride; stride >>= 1) {
+        if (tid < stride) reductions[tid] += reductions[tid + stride];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float inverse = rsqrt(reductions[0] / float(args.width) + args.epsilon);
+    size_t base = size_t(row_map[row]) * args.slots * args.width;
+    for (uint column = tid; column < args.width; column += threads) {
+        #pragma clang fp contract(off)
+        float normalized = h3_bf16_to_f32(h3_f32_to_bf16(
+            h3_bf16_to_f32(x[column]) * inverse * h3_bf16_to_f32(weight[column])));
+        float shift = modulation[base + args.shift_slot * args.width + column];
+        float scale = modulation[base + args.scale_slot * args.width + column];
+        float factor = 1.0f + scale;
+        float scaled = normalized * factor;
+        output[size_t(row) * args.width + column] = scaled + shift;
+    }
+}
+
 /* Preserve the standalone AdaLN reduction tree while emitting only the one
  * F32 inverse RMS scalar needed by the fused final projection. */
 kernel void h3_rms_inverse_bf16(

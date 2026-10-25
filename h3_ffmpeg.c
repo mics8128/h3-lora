@@ -263,14 +263,15 @@ int h3_ffmpeg_read_image_f32(const char *path, int width, int height,
     return 1;
 }
 
-int h3_ffmpeg_read_video_f32(const char *path, int width, int height,
-                             int max_frames, float **pixels, int *frames,
-                             char *error, size_t error_size) {
+static int read_video_range(const char *path, int width, int height,
+    int start_frame, int max_frames, h3_image_fit fit, int exact,
+    float **pixels, int *frames, char *error, size_t error_size) {
     if (error && error_size) error[0] = '\0';
     if (pixels) *pixels = NULL;
     if (frames) *frames = 0;
     if (!path || !*path || !pixels || !frames || width < 1 || height < 1 ||
-        max_frames < 5 || (size_t)width > SIZE_MAX / (size_t)height) {
+        start_frame < 0 || max_frames < 5 || (exact && max_frames%17!=5) ||
+        (size_t)width > SIZE_MAX / (size_t)height) {
         fail(error, error_size, "invalid FFmpeg video input arguments");
         return 0;
     }
@@ -290,9 +291,12 @@ int h3_ffmpeg_read_video_f32(const char *path, int width, int height,
         fail(error, error_size, "out of memory decoding input video");
         return 0;
     }
-    char filter[256], frame_limit[32];
-    snprintf(filter, sizeof(filter),
-             "fps=24,scale=%d:%d:flags=lanczos,setsar=1", width, height);
+    char filter[512], frame_limit[32];
+    if (fit==H3_IMAGE_FIT_COVER)
+        snprintf(filter,sizeof(filter),"fps=24,trim=start_frame=%d:end_frame=%lld,setpts=PTS-STARTPTS,scale=%d:%d:flags=lanczos:force_original_aspect_ratio=increase,crop=%d:%d,setsar=1",
+            start_frame,(long long)start_frame+max_frames,width,height,width,height);
+    else snprintf(filter,sizeof(filter),"fps=24,trim=start_frame=%d:end_frame=%lld,setpts=PTS-STARTPTS,scale=%d:%d:flags=lanczos,setsar=1",
+            start_frame,(long long)start_frame+max_frames,width,height);
     snprintf(frame_limit, sizeof(frame_limit), "%d", max_frames);
     int stream[2];
     if (pipe(stream) != 0) {
@@ -351,6 +355,9 @@ int h3_ffmpeg_read_video_f32(const char *path, int width, int height,
         return 0;
     }
     int frame_count = (int)(received / frame_bytes);
+    if (exact && frame_count != max_frames) {
+        free(rgb); fail(error,error_size,"guide source range requires exactly %d frames; decoded %d",max_frames,frame_count);return 0;
+    }
     if (frame_count < 5) {
         free(rgb);
         fail(error, error_size,
@@ -386,16 +393,26 @@ int h3_ffmpeg_read_video_f32(const char *path, int width, int height,
     return 1;
 }
 
-int h3_ffmpeg_read_audio_f32(const char *path, int max_samples,
-                             int truncate_at_limit,
-                             float **pcm, int *samples,
-                             char *error, size_t error_size) {
-    enum { AUDIO_RATE = 32000, AUDIO_CHANNELS = 2, MIN_SAMPLES = 64000 };
+int h3_ffmpeg_read_video_f32(const char *path,int width,int height,int max_frames,
+    float **pixels,int *frames,char *error,size_t error_size) {
+    return read_video_range(path,width,height,0,max_frames,H3_IMAGE_FIT_STRETCH,0,
+        pixels,frames,error,error_size);
+}
+int h3_ffmpeg_read_video_range_f32(const char *path,int width,int height,int start_frame,int frames,
+    float **pixels,char *error,size_t error_size) {
+    int actual=0;
+    return read_video_range(path,width,height,start_frame,frames,H3_IMAGE_FIT_COVER,1,
+        pixels,&actual,error,error_size);
+}
+
+static int read_audio_range(const char *path, int64_t start_sample, int max_samples,
+    int truncate_at_limit, float **pcm, int *samples, char *error, size_t error_size) {
+    enum { AUDIO_RATE = 32000, AUDIO_CHANNELS = 2, MIN_SAMPLES = 1 };
     if (error && error_size) error[0] = '\0';
     if (pcm) *pcm = NULL;
     if (samples) *samples = 0;
-    if (!path || !*path || !pcm || !samples || max_samples < MIN_SAMPLES ||
-        max_samples > AUDIO_RATE * 15 ||
+    if (!path || !*path || !pcm || !samples || start_sample < 0 || max_samples < MIN_SAMPLES ||
+        max_samples > AUDIO_RATE * 16 ||
         (truncate_at_limit != 0 && truncate_at_limit != 1)) {
         fail(error, error_size, "invalid FFmpeg audio input arguments");
         return 0;
@@ -411,6 +428,8 @@ int h3_ffmpeg_read_audio_f32(const char *path, int max_samples,
         return 0;
     }
     char duration[64];
+    char filter[128];
+    snprintf(filter,sizeof(filter),"aresample=32000,atrim=start_sample=%lld,asetpts=PTS-STARTPTS",(long long)start_sample);
     double seconds = (double)max_samples / (double)AUDIO_RATE;
     if (!truncate_at_limit) seconds += 1.0 / (double)AUDIO_RATE;
     snprintf(duration, sizeof(duration), "%.9f", seconds);
@@ -423,7 +442,7 @@ int h3_ffmpeg_read_audio_f32(const char *path, int max_samples,
     }
     char *arguments[] = {
         "ffmpeg", "-v", "error", "-i", (char *)path,
-        "-map", "0:a:0", "-vn", "-ac", "2", "-ar", "32000",
+        "-map", "0:a:0", "-vn", "-af", filter, "-ac", "2", "-ar", "32000",
         "-t", duration, "-f", "f32le", "pipe:1", NULL
     };
     posix_spawn_file_actions_t actions;
@@ -468,7 +487,8 @@ int h3_ffmpeg_read_audio_f32(const char *path, int max_samples,
     if (!truncate_at_limit && trailing > 0) {
         free(interleaved);
         fail(error, error_size,
-             "reference audio exceeds the 15 second total limit");
+             "audio exceeds the requested decoded limit (%d samples at 32 kHz)",
+             max_samples);
         return 0;
     }
     if (!WIFEXITED(status) || WEXITSTATUS(status) != 0 ||
@@ -482,7 +502,7 @@ int h3_ffmpeg_read_audio_f32(const char *path, int max_samples,
     if (sample_count < MIN_SAMPLES) {
         free(interleaved);
         fail(error, error_size,
-             "reference audio requires at least 2 seconds at 32 kHz");
+             "audio input must contain at least one sample at 32 kHz");
         return 0;
     }
     size_t output_elements = (size_t)sample_count * AUDIO_CHANNELS;
@@ -502,6 +522,15 @@ int h3_ffmpeg_read_audio_f32(const char *path, int max_samples,
     *pcm = channel_major;
     *samples = sample_count;
     return 1;
+}
+
+int h3_ffmpeg_read_audio_f32(const char *path,int max_samples,int truncate_at_limit,
+    float **pcm,int *samples,char *error,size_t error_size) {
+    return read_audio_range(path,0,max_samples,truncate_at_limit,pcm,samples,error,error_size);
+}
+int h3_ffmpeg_read_audio_range_f32(const char *path,int64_t start_sample,int max_samples,
+    int truncate_at_limit,float **pcm,int *samples,char *error,size_t error_size) {
+    return read_audio_range(path,start_sample,max_samples,truncate_at_limit,pcm,samples,error,error_size);
 }
 
 int h3_ffmpeg_write_rgb24(const char *path, const uint8_t *frames,

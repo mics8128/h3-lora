@@ -104,6 +104,7 @@ struct h3_dit {
     float token_reduction_scale;
     float spatial_rope_scale;
     int bf16_final;
+    int curve_final;
     unsigned core_reuse_interval;
     unsigned core_forward_count;
     int core_residual_ready;
@@ -324,11 +325,42 @@ static int validate_layout(h3_dit *dit, const h3_text_embedding *text,
             return 0;
         }
         size_t rows = segment->stop - segment->start;
+        int visual_condition = segment->kind == H3_SEG_COND ||
+            segment->kind == H3_SEG_REF_IMAGE;
+        int sound_condition = segment->kind == H3_SEG_COND_AUDIO ||
+            segment->kind == H3_SEG_REF_AUDIO;
+        if (visual_condition || sound_condition) {
+            size_t capacity = visual_condition ? layout->img_cond_rows :
+                                                layout->audio_cond_rows;
+            if (segment->payload_offset > capacity ||
+                rows > capacity - segment->payload_offset) {
+                fail(error, error_size, "condition payload span is out of range");
+                return 0;
+            }
+            for (size_t previous = 0; previous < index; previous++) {
+                const h3_segment *other = &layout->segments[previous];
+                int same_stream = visual_condition ?
+                    (other->kind == H3_SEG_COND || other->kind == H3_SEG_REF_IMAGE) :
+                    (other->kind == H3_SEG_COND_AUDIO || other->kind == H3_SEG_REF_AUDIO);
+                size_t other_rows = other->stop - other->start;
+                if (same_stream && rows && other_rows &&
+                    segment->payload_offset < other->payload_offset + other_rows &&
+                    other->payload_offset < segment->payload_offset + rows) {
+                    fail(error, error_size, "condition payload spans overlap");
+                    return 0;
+                }
+            }
+        }
         switch (segment->kind) {
         case H3_SEG_TEXT: text_rows += rows; break;
         case H3_SEG_COND:
-        case H3_SEG_REF_IMAGE: video_condition += rows; break;
-        case H3_SEG_REF_AUDIO: audio_condition += rows; break;
+        case H3_SEG_REF_IMAGE:
+            video_condition += rows;
+            break;
+        case H3_SEG_COND_AUDIO:
+        case H3_SEG_REF_AUDIO:
+            audio_condition += rows;
+            break;
         case H3_SEG_AUDIO:
             audio_target += rows;
             target_audio_segments++;
@@ -1079,11 +1111,15 @@ static int prepare_projection_maps(h3_dit *dit, char *error,
             segment->kind == H3_SEG_REF_IMAGE ||
             segment->kind == H3_SEG_VIDEO) {
             for (size_t row = 0; video && row < rows; row++)
-                video[video_offset + row] = (uint32_t)(segment->start + row);
+                video[(segment->kind == H3_SEG_VIDEO ?
+                    dit->video_condition_rows : segment->payload_offset) + row] =
+                    (uint32_t)(segment->start + row);
             video_offset += rows;
         } else if (segment->kind != H3_SEG_TEXT) {
             for (size_t row = 0; audio && row < rows; row++)
-                audio[audio_offset + row] = (uint32_t)(segment->start + row);
+                audio[(segment->kind == H3_SEG_AUDIO ?
+                    dit->audio_condition_rows : segment->payload_offset) + row] =
+                    (uint32_t)(segment->start + row);
             audio_offset += rows;
         }
     }
@@ -1353,8 +1389,6 @@ static int allocate_activations(h3_dit *dit, char *error, size_t error_size) {
         BF(key, sequence * INNER),
         BF(value, sequence * INNER),
         BF(attention_output, sequence * HIDDEN),
-        F32(final_audio_inverse, audio),
-        F32(final_video_inverse, video),
         BF(audio_output_bf16, audio * AUDIO_CHANNELS),
         BF(video_output_bf16, video * VIDEO_PATCH)
     };
@@ -1363,6 +1397,15 @@ static int allocate_activations(h3_dit *dit, char *error, size_t error_size) {
     for (size_t index = 0; index < sizeof(all) / sizeof(*all); index++) {
         if (!all[index]) {
             fail(error, error_size, "cannot allocate DiT activation arena: %s",
+                 h3_gpu_error(dit->gpu));
+            return 0;
+        }
+    }
+    if (dit->bf16_final) {
+        dit->final_audio_inverse = h3_gpu_tensor_new_f32(dit->gpu, audio);
+        dit->final_video_inverse = h3_gpu_tensor_new_f32(dit->gpu, video);
+        if (!dit->final_audio_inverse || !dit->final_video_inverse) {
+            fail(error, error_size, "cannot allocate final-head RMS scratch: %s",
                  h3_gpu_error(dit->gpu));
             return 0;
         }
@@ -1410,7 +1453,7 @@ static int allocate_activations(h3_dit *dit, char *error, size_t error_size) {
              h3_gpu_error(dit->gpu));
         return 0;
     }
-    if (getenv("H3_DISABLE_FUSED_FINAL_SLICE")) {
+    if (!dit->curve_final && getenv("H3_DISABLE_FUSED_FINAL_SLICE")) {
         dit->final_audio_input = h3_gpu_tensor_new_bf16(
             dit->gpu, audio * HIDDEN);
         dit->final_video_input = h3_gpu_tensor_new_bf16(
@@ -1422,8 +1465,9 @@ static int allocate_activations(h3_dit *dit, char *error, size_t error_size) {
             return 0;
         }
     }
-    if (!dit->bf16_final || getenv("H3_DISABLE_FUSED_FINAL_HEAD") ||
-        getenv("H3_DISABLE_FUSED_FINAL_SLICE")) {
+    if (!dit->curve_final && (!dit->bf16_final ||
+        getenv("H3_DISABLE_FUSED_FINAL_HEAD") ||
+        getenv("H3_DISABLE_FUSED_FINAL_SLICE"))) {
         dit->final_audio_norm = h3_gpu_tensor_new_bf16(
             dit->gpu, audio * HIDDEN);
         dit->final_video_norm = h3_gpu_tensor_new_bf16(
@@ -1565,6 +1609,8 @@ static int prepare_request(h3_dit *dit, const h3_lora_stack *loras,
             error, error_size);
         if (!dit->schedule) return 0;
     }
+    dit->curve_final = h3_dit_schedule_final_is_f32(dit->schedule);
+    if (dit->curve_final) dit->bf16_final = 0;
     configure_gate_ranked_blocks(dit);
     if (loras && dit->active_block_count < H3_DIT_BLOCKS) {
         static const char *const stems[] = {
@@ -1690,10 +1736,9 @@ static h3_dit *load_dit(const char *weight_directory,
         return NULL;
     }
     dit->fused_mlp = getenv("H3_DISABLE_FUSED_MLP") == NULL;
-    /* The released final heads are F32, but their inputs are already BF16.
-     * Converting these small weights once selects the Iris-derived tiled
-     * linear and eliminates two full-width casts plus the scalar F32 kernel.
-     * Keep the old path available for close-reference diagnosis. */
+    /* Standard full-width checkpoints retain the native BF16 final-head fast
+     * path. Curve checkpoints promote final modulation to F32 and disable this
+     * conversion in prepare_request, before loading weights or activations. */
     dit->bf16_final = getenv("H3_DIT_F32_FINAL") == NULL;
     dit->core_reuse_interval = core_reuse_interval;
     dit->ssd_streaming = ssd_streaming;
@@ -2141,7 +2186,8 @@ static int encode_forward(h3_dit *dit, int step, int begin, int submit,
                 if (!dit->video_projection_map)
                     OP(h3_gpu_patch_linear_bf16_offset(
                         dit->gpu, dit->hidden, destination, dit->video_input,
-                        video_offset * VIDEO_PATCH, dit->video_patch_w,
+                        (segment->kind == H3_SEG_VIDEO ?
+                            dit->video_condition_rows : segment->payload_offset) * VIDEO_PATCH, dit->video_patch_w,
                         dit->video_patch_b, (uint32_t)segment_rows,
                         VIDEO_PATCH, HIDDEN), "project packed video source");
                 video_offset += segment_rows;
@@ -2149,7 +2195,8 @@ static int encode_forward(h3_dit *dit, int step, int begin, int submit,
                 if (!dit->audio_projection_map)
                     OP(h3_gpu_patch_linear_bf16_offset(
                         dit->gpu, dit->hidden, destination, dit->audio_input,
-                        audio_offset * AUDIO_CHANNELS, dit->audio_patch_w,
+                        (segment->kind == H3_SEG_AUDIO ?
+                            dit->audio_condition_rows : segment->payload_offset) * AUDIO_CHANNELS, dit->audio_patch_w,
                         dit->audio_patch_b, (uint32_t)segment_rows,
                         AUDIO_CHANNELS, HIDDEN),
                        "project packed audio source");
@@ -2199,13 +2246,15 @@ static int encode_forward(h3_dit *dit, int step, int begin, int submit,
                        segment->kind == H3_SEG_VIDEO) {
                 OP(h3_gpu_copy_bf16(
                     dit->gpu, dit->hidden, destination, dit->video_projected,
-                    video_offset * HIDDEN, segment_rows * HIDDEN),
+                    (segment->kind == H3_SEG_VIDEO ? dit->video_condition_rows :
+                        segment->payload_offset) * HIDDEN, segment_rows * HIDDEN),
                    "pack video source");
                 video_offset += segment_rows;
             } else {
                 OP(h3_gpu_copy_bf16(
                     dit->gpu, dit->hidden, destination, dit->audio_projected,
-                    audio_offset * HIDDEN, segment_rows * HIDDEN),
+                    (segment->kind == H3_SEG_AUDIO ? dit->audio_condition_rows :
+                        segment->payload_offset) * HIDDEN, segment_rows * HIDDEN),
                    "pack audio source");
                 audio_offset += segment_rows;
             }
@@ -2377,7 +2426,18 @@ static int encode_forward(h3_dit *dit, int step, int begin, int submit,
     int fused_final_head = dit->bf16_final &&
         !getenv("H3_DISABLE_FUSED_FINAL_HEAD") &&
         !getenv("H3_DISABLE_FUSED_FINAL_SLICE");
-    if (fused_final_head) {
+    if (dit->curve_final) {
+        OP(h3_gpu_adaln_bf16_f32_offset(
+            dit->gpu, dit->final_audio_f32, dit->hidden,
+            (size_t)dit->audio_target_start * HIDDEN, dit->final_norm, final,
+            dit->final_audio_maps[step], dit->audio_rows, HIDDEN, FINAL_SLOTS,
+            0, 1, 1e-5f), "curve final audio F32 modulation");
+        OP(h3_gpu_adaln_bf16_f32_offset(
+            dit->gpu, dit->final_video_f32, dit->hidden,
+            (size_t)dit->video_target_start * HIDDEN, dit->final_norm, final,
+            dit->final_video_maps[step], dit->video_rows, HIDDEN, FINAL_SLOTS,
+            0, 1, 1e-5f), "curve final video F32 modulation");
+    } else if (fused_final_head) {
         OP(h3_gpu_adaln_linear_bf16(
             dit->gpu, dit->audio_output_bf16, dit->final_audio_inverse,
             dit->hidden, (size_t)dit->audio_target_start * HIDDEN,
@@ -2429,12 +2489,14 @@ static int encode_forward(h3_dit *dit, int step, int begin, int submit,
             dit->video_rows, HIDDEN, VIDEO_PATCH),
            "BF16 final video head");
     } else if (!dit->bf16_final) {
-        OP(h3_gpu_cast_bf16_to_f32(dit->gpu, dit->final_audio_f32,
-            dit->final_audio_norm, dit->audio_rows * HIDDEN),
-           "final audio F32 cast");
-        OP(h3_gpu_cast_bf16_to_f32(dit->gpu, dit->final_video_f32,
-            dit->final_video_norm, dit->video_rows * HIDDEN),
-           "final video F32 cast");
+        if (!dit->curve_final) {
+            OP(h3_gpu_cast_bf16_to_f32(dit->gpu, dit->final_audio_f32,
+                dit->final_audio_norm, dit->audio_rows * HIDDEN),
+               "final audio F32 cast");
+            OP(h3_gpu_cast_bf16_to_f32(dit->gpu, dit->final_video_f32,
+                dit->final_video_norm, dit->video_rows * HIDDEN),
+               "final video F32 cast");
+        }
         OP(h3_gpu_linear_f32(dit->gpu, dit->audio_output,
             dit->final_audio_f32, dit->final_audio_w, dit->final_audio_b,
             dit->audio_rows, HIDDEN, AUDIO_CHANNELS), "final audio head");
@@ -2860,6 +2922,8 @@ typedef struct {
     h3_dit_preview preview;
     void *preview_opaque;
     int evaluations;
+    h3_sampler_observe transition;
+    void *transition_opaque;
 } h3_simple_adapter;
 
 static int simple_evaluate(int step, const float *video, const float *audio,
@@ -2875,8 +2939,9 @@ static int simple_evaluate(int step, const float *video, const float *audio,
 
 static int simple_observe(int completed, const float *video,
     const float *audio, void *opaque, char *error, size_t error_size) {
-    (void)audio;
     h3_simple_adapter *adapter = opaque;
+    if (adapter->transition && !adapter->transition(completed, video, audio,
+            adapter->transition_opaque, error, error_size)) return 0;
     if (adapter->preview && adapter->preview(completed,
             adapter->dit->sigmas.steps, video,
             h3_dit_video_elements(adapter->dit), adapter->preview_opaque)) {
@@ -2897,18 +2962,21 @@ int h3_dit_denoise_simple_preview(h3_dit *dit, h3_sampler_kind kind,
     if (error && error_size) error[0] = '\0';
     if (!dit || dit->sigmas.steps != h3_dit_schedule_steps(dit->schedule) ||
         dit->core_reuse_interval != 1 || dit->token_reduction) {
-        fail(error, error_size, "simple sampling requires core reuse 1 and no token reduction");
+        fail(error, error_size, "explicit-grid sampling requires core reuse 1 and no token reduction");
         return 0;
     }
-    h3_simple_adapter adapter = {dit, progress, progress_opaque, preview, preview_opaque, 0};
+    h3_simple_adapter adapter = {.dit = dit, .progress = progress,
+        .progress_opaque = progress_opaque, .preview = preview,
+        .preview_opaque = preview_opaque};
     int ok = h3_sampler_run(kind, &dit->sigmas, video_shift, audio_shift,
         seed, video_latent, h3_dit_video_elements(dit),
         audio_latent, h3_dit_audio_elements(dit), simple_evaluate, &adapter,
         NULL, NULL, simple_observe, &adapter, error, error_size);
     if (getenv("H3_PROFILE")) {
         const char *name = kind == H3_SAMPLER_EULER ? "euler" :
-                           kind == H3_SAMPLER_LCM ? "lcm" : "res_multistep";
-        fprintf(stderr, "h3 sampler: {\"kind\":\"%s\",\"scheduler\":\"simple\","
+                           kind == H3_SAMPLER_LCM ? "lcm" :
+                           kind == H3_SAMPLER_ER_SDE ? "er_sde" : "res_multistep";
+        fprintf(stderr, "h3 sampler: {\"kind\":\"%s\",\"scheduler\":\"explicit\","
                         "\"nfe\":%d,\"success\":%d,\"video_sigmas\":[",
                 name, adapter.evaluations, ok);
         for (int i = 0; i <= dit->sigmas.steps; i++)
@@ -2918,7 +2986,39 @@ int h3_dit_denoise_simple_preview(h3_dit *dit, h3_sampler_kind kind,
             fprintf(stderr, "%s%.9g", i ? "," : "", dit->sigmas.audio[i]);
         fprintf(stderr, "]}\n");
     }
-    h3_gpu_profile_mark(dit->gpu, "simple denoise");
+    h3_gpu_profile_mark(dit->gpu, "explicit-grid denoise");
+    return ok;
+}
+
+int h3_dit_denoise_state(h3_dit *dit, h3_sampler_state *state, int stop_step,
+    h3_dit_progress progress, void *progress_opaque,
+    h3_dit_preview preview, void *preview_opaque,
+    h3_sampler_observe transition, void *transition_opaque,
+    char *error, size_t error_size) {
+    if (error && error_size) error[0] = '\0';
+    const h3_sampler_config *config = h3_sampler_state_config(state);
+    if (!dit || !config || dit->core_reuse_interval != 1 ||
+        dit->token_reduction || config->schedule.steps != dit->sigmas.steps ||
+        config->schedule.steps != h3_dit_schedule_steps(dit->schedule) ||
+        config->video_count != h3_dit_video_elements(dit) ||
+        config->audio_count != h3_dit_audio_elements(dit)) {
+        fail(error, error_size, "controlled sampling requires matching shape/schedule, core reuse 1 and no token reduction");
+        return 0;
+    }
+    for (int step = 0; step <= dit->sigmas.steps; step++) {
+        if (config->schedule.video[step] != dit->sigmas.video[step] ||
+            config->schedule.audio[step] != dit->sigmas.audio[step]) {
+            fail(error, error_size, "controlled sampler sigma schedule differs from prepared DiT");
+            return 0;
+        }
+    }
+    h3_simple_adapter adapter = {.dit = dit, .progress = progress,
+        .progress_opaque = progress_opaque, .preview = preview,
+        .preview_opaque = preview_opaque, .transition = transition,
+        .transition_opaque = transition_opaque};
+    int ok = h3_sampler_state_run(state, stop_step, simple_evaluate, &adapter,
+        NULL, NULL, simple_observe, &adapter, error, error_size);
+    h3_gpu_profile_mark(dit->gpu, "controlled denoise");
     return ok;
 }
 

@@ -60,15 +60,22 @@ initialize with `H3_PARAMS_DEFAULT` to retain Euler/serving/12/3 behavior.
 
 ## Turbo sampler selection
 
-`--sampler euler|lcm|res_multistep --scheduler serving|simple`
+`--sampler euler|lcm|res_multistep|er_sde --scheduler serving|simple|beta|beta57`
 and `--video-shift FLOAT --audio-shift FLOAT` expose explicit numerical contracts.
 The default Euler/serving/12/3 retains the existing GPU path and initialization.
-Serving supports Euler only. Simple uses the discrete 1,000-entry Comfy schedule
-and packed audiovisual state, not independent native audio/video Euler clocks.
-Simple requires 50 blocks, full output canvas, no token reduction, and
-`--reuse 1 --core-reuse 1`; unsupported combinations fail before encoding.
-LCM uses run-local seeded re-noising; seeds are not PyTorch-identical noise.
-See [the second Astra specification and recommendation record](TURBO_DESIGN.md).
+Serving supports Euler only. Simple uses the discrete 1,000-entry Comfy schedule;
+beta and beta57 use Beta(.6,.6) and Beta(.5,.7) quantiles on its999-index grid,
+ties-to-even, adjacent deduplication and terminal zero. Effective transitions
+can be fewer than requested. These explicit grids use packed audiovisual state,
+not independent native audio/video clocks, and require50blocks, full canvas,
+no token reduction and `--reuse 1 --core-reuse 1`.
+LCM and ER-SDE use run-local seeded noise, not PyTorch-identical Gaussian draws.
+ER-SDE retains raw clean prediction/derivative history and applies its first-sigma
+offset before model timestep precomputation, preserving upstream initial-noising
+ordering. Solver3/revision1 checkpoints add a seventh float array; old sampler
+checkpoints retain their existing format. Unknown revisions are rejected by both
+native and task asset inspection. See [beta5 setup and numerical provenance](EROS_BETA5_SETUP.md)
+and [the earlier Astra Turbo specification](TURBO_DESIGN.md).
 Sampler correctness and adapter loadability alone do not establish visual quality.
 The [comparison runner and exact artifact inventory](COMPARISON.md) cover all 21
 Turbo weights with per-family settings and a separately labelled DMAD sampler
@@ -154,8 +161,8 @@ h3> Make the person shown in Picture 1 wave to the camera.
 ```
 
 `!refs` lists the current order, `!ref-remove N` removes one entry, and
-`!refs clear` removes them all. Ref2VA references cannot be mixed with
-`!first`/`!last` anchors.
+`!refs clear` removes them all. Ordered Ref2VA references may coexist with
+`!first`/`!last` and timed guides; the selected LoRA target must still match Ref2VA.
 
 ### 2. Make a first fast video
 
@@ -453,7 +460,7 @@ For example:
 
 ### 8. Add image, video, and audio references
 
-First/last-frame anchors select the FL2VA path:
+First/last-frame anchors alone use FL2VA; when combined with ordered references they become fixed timed guides on the Ref2VA path. Neither mechanism guarantees pixel-identical output frames:
 
 ```sh
 ./h3 -d ./MiniMax-H3 -p "The fox keeps walking through the snow." \
@@ -874,9 +881,9 @@ VAE's causal `ceil(T/4)` compression, two-frame Qwen sampling, and timestamped
 `<Video N>` presentation. `--ref-video` preserves an embedded soundtrack,
 `--ref-video-audio VIDEO AUDIO` supplies an explicit replacement, and
 `--ref-audio` appends an ordered standalone clip. Reference audio is decoded as
-32 kHz stereo F32, encoded by the native AudioVAE posterior-mean path, mixed as
-0.999 clean latent plus 0.001 seeded noise, pinned to the audio condition
-timestep 1.0, and packed as width-32 rows on the same rotary timeline as visual
+32 kHz stereo F32 and encoded by the native AudioVAE posterior-mean path.
+Reference audio uses clean augmentation strength **1.0**, pinned to the audio
+condition timestep 1.0, and packed as width-32 rows on the rotary timeline of visual
 references. Audio inputs are 2-15 seconds, at most three are
 accepted, and their total decoded duration is capped at 15 seconds. Standalone
 audio-only Ref2VA is supported, including active Ref2VA LoRAs; its audio latent
@@ -1013,3 +1020,110 @@ trees. One-shot generation loads and releases phases separately. Interactive
 session caching intentionally keeps compatible DiT weights and the video decoder
 resident while rebuilding conditioning; peak memory therefore depends on the
 retained model, reference workload and workspace. `!cache clear` releases them.
+
+## Native content controls and machine execution
+
+This section documents the current fork, not an unmodified upstream snapshot. Ordered references and fixed target-time guides are separate inputs. References provide subject/style/motion/voice evidence; guides inject encoded conditioning rows at a target time. Neither guarantees identical decoded pixels, a copied soundtrack, voice identity or seamless motion.
+
+### Timed guides and public C calls
+
+The CLI accepts `--guide-image FRAME PATH`, `--guide-clip FRAME PATH`, `--guide-audio FRAME PATH`, and `--guide-clip-audio FRAME PATH`. `--guide-source-start N` and `--guide-source-frames N` modify the preceding guide's source span; `--guide-audio-path PATH` pairs external audio with the preceding clip. Clip guides require an explicit valid `17k+5` span; invalid lengths, out-of-target placement and same-stream overlaps are errors, not hidden trimming or last-wins precedence. Source selection can address a bounded clip inside a longer source. Native frame indices are resolved nonnegative target pixel-frame indices; the Python planner resolves end-relative indices before execution. Interactive equivalents are `!guide-image`, `!guide-clip`, `!guide-audio`, `!guide-clip-audio`, `!guide-span`, `!guide-audio-path` and `!guides [clear]`.
+
+`h3.h` exposes `h3_guide {kind,path,audio_path,frame_index,source_start_frame,source_frames,include_embedded_audio}` and `h3_params.guides/guide_count`. First/last convenience fields remain accepted, but execute through guide conditioning. Mixed references require the actual Ref2VA model and matching adapter target; no silent FL2VA fallback is performed.
+
+Additional synchronous public calls are:
+
+```c
+h3_result *h3_resume(h3_ctx *, const char *prompt, const h3_params *);
+h3_result *h3_encode_media(h3_ctx *, const char *input_path,
+                          int stream_policy, const h3_params *);
+h3_result *h3_decode_latent(h3_ctx *, const char *input_path,
+                           int diagnostic_preview, const h3_params *);
+```
+
+`h3_encode_media` stream policies are `1` video, `2` audio, `3` audiovisual. Set `latent_output_path` for encode and `output_path` for decode. Video encoding requires the requested frame count and explicitly converts encoder `ceil(T/4)` time to generation cadence using endpoint-aligned linear interpolation; this is marked in the latent metadata, not a claim of lossless temporal equivalence. Standalone audio encode uses an explicit 16-second decode bound; it is distinct from Ref2VA references' 2–15-second/aggregate15-second policy. Audiovisual encode aligns audio to the requested video duration. An audio-only latent need not invent a video stream. Generating an audiovisual target from initial latents still requires compatible target streams/shapes.
+
+### Latents, partial denoise, masks and checkpoints
+
+`h3_params` adds `initial_latent_path`, `mask_path`, `start_transition`, `resume_path`, `checkpoint_path`, `latent_output_path`, `request_digest` and `on_transition`. Start transition indexes the **original full dual-stream sigma schedule**; initial clean latents are noised at each stream's own sigma before controlled sampling. Terminal start is decode-only. A new edit resets solver history; exact resume restores it and does not permit a changed prompt, conditioning, model/adapters, shape, schedule or execution configuration. Native execution derives its identity as well as using the supplied digest; repeating a digest cannot authorize a different computation.
+
+Native files are versioned envelopes, **not safetensors/Comfy latent interchange**: clean latent type5; solver state type4. `h3_latent` records video latent dimensions/count, audio latent length/count, optional absent streams, source frame count and temporal mapping (`0` generated/native, `1` encoder-linear-endpoints). Video is channel-major `[24,T,H/16,W/16]`; audio `[32,2,T]`. Payload is native-endian IEEE float; incompatible representation, malformed lengths/shapes and nonfinite tensors are rejected. Do not reinterpret raw encoder temporal output as generated cadence or import foreign normalization based on filename.
+
+Masks use the same native latent container, with per-element finite weights: **0 preserves, 1 edits**. Protected values follow fixed clean/noise trajectories at their own stream's sigma; soft-mask projection occurs once per completed proposal, not again on model predictions. RES history keeps raw clean predictions. Fully protected terminal **latents** match clean preservation values; VAE decoding still need not reproduce original source pixels/audio exactly.
+
+Controlled stateful execution requires full50layers, denoise reuse1, core reuse1, no token reduction and no SSD streaming; unsupported approximation combinations fail instead of silently dropping cache state. This is CPU sampler orchestration around native model evaluation, not a faster-path claim. The existing noncontrolled GPU path may round differently; compare interrupted/resumed execution to an uninterrupted run of the **same controlled path**.
+
+`h3_transition_callback` returns0 continue,1 pause,2 cancel at completed transition boundaries. A pause must publish a valid checkpoint before returning paused. `h3_result.status` is0 succeeded,1 paused,2 cancelled; a non-null result is not automatically a completed video. `diagnostic_preview` distinguishes explicitly requested nonterminal checkpoint decoding from a final clean result. Errors return null and are available through `h3_last_error`, `h3_last_error_code`, and `h3_last_error_field`. Callers must inspect status before final-output publication and free results normally.
+
+Performance execution modes are orthogonal to quality/precision: task.execution_mode overrides profile.execution_mode then administrator execution_mode, defaulting to `throughput`. Resolved plans/jobs/inspect expose execution_mode, execution_reason and controls. Throughput omits native control/checkpoint, retains the ordinary supported native route, and offers process-abort cancellation without a checkpoint or partial-output publication; pause/resume return an actionable repair to prepare a resumable task. Resumable adds boundary control/checkpoint and requires full layers/reuse1/no reduction/no SSD. Initial-latent/mask/partial edits automatically select resumable; explicitly requesting throughput for such an edit fails. Native transition callback is installed only for an actual control path. Human CLI without controlled options retains its normal route. No speed percentage or warm-throughput parity is established by this contract. Exact-resume eligibility does not mean all-BF16 arithmetic or better perceptual quality.
+
+The AI queue worker starts a **new native process per job**: `Tasks.worker` calls `execute_native`, whose `subprocess.Popen([engine,"--manifest",path],...)` launches execution. Media-source encoding is another subprocess. Native resident weights/context/conditioning are not shared across jobs, so repeat tasks repay loading, adapter merge and quantization despite possible warm filesystem pages. Existing human interactive caching remains available and can have materially different warm latency. Process-cold benchmarks cannot certify optimal resident throughput; a persistent native worker is not implemented or promised here.
+
+### Strict manifest and events
+
+`./h3 --capabilities-json` performs no model loading and emits schema1 mechanism availability with `model_inventory_probed:false`, `requires_model:true` and quality evidence. This probes implemented interfaces, **not installed-weight availability or quality acceptance**. `./h3 --manifest PATH` is a standalone invocation; do not combine it with ordinary flags. It validates a bounded strict JSON document and rejects unknown/duplicate/malformed fields.
+
+Required manifest fields: `schema_version:1`, `operation` (`generate`, `resume`, `encode`, `decode`), `model_dir`, `target` (`fl2va` or `ref2va`), `request_digest` (64hex digits), and `params`. Optional top-level fields are `prompt`, ordered `references`, `guides`, `loras`, `control_path`, and `checkpoint_path` (or put checkpoint_path in params, not both). References contain `kind`, `path`, optional `audio_path/include_embedded_audio`; guide entries additionally contain `frame_index` and optional source span. LoRAs contain `path,strength`.
+
+```json
+{"schema_version":1,"operation":"generate","model_dir":"/models/H3","target":"ref2va","request_digest":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","prompt":"A person walks forward.","params":{"width":512,"height":512,"frames":22,"steps":8,"sampler":"res_multistep","scheduler":"simple","video_shift":12,"audio_shift":3,"dit_layers":50,"denoise_reuse":1,"core_reuse":1,"output_path":"/outputs/result.mp4","vae_precision":"f32"},"references":[{"kind":"image","path":"/assets/person.png"}],"guides":[{"kind":"image","path":"/assets/opening.png","frame_index":0}]}
+```
+
+This is a wiring-sized request, not a checkpoint-quality recommendation. `params` supports the native geometry/sampling/execution fields and latent/control paths. Encode/decode use `input_path`; encode supports integer `stream_policy`; decode supports integer `diagnostic_preview`0/1. `vae_precision` is `f32` or `bf16`. Generate/resume manifests require resolved `17k+5` frame count and at least one requested media/latent output; encode requires a latent output and decode a media output. `preview_denoise` is not accepted in machine execution. Use capabilities and administrator profiles rather than asking a small model to invent kernel flags.
+
+Stdout is versioned JSONL: progress events followed by terminal `result`, `paused`, `cancelled`, or `error`; stderr retains diagnostics. Terminal output fields are `media`, `latent`, `checkpoint`, with null for unpublished artifacts. Success checks requested regular output files before reporting completion. `error` includes structured code/field/message. An optional control file contains exactly `{"action":"run"}`, `{"action":"pause"}`, or `{"action":"cancel"}`; control requires checkpoint output configuration. An unreadable/malformed control file is an error, not a successful cancellation. Plan/job persistence is provided by the Python module below, not by this one-shot manifest runner.
+
+## AI task interface
+
+`tools/h3_tasks.py` is a Python-standard-library durable local planner and serialized worker. It is not a hosted model, HTTP server, official Context-IR implementation or guarantee of generation quality.
+
+```sh
+python3 tools/h3_tasks.py capabilities --json --root /absolute/task-state --config /absolute/admin.json <<<'{}'
+python3 tools/h3_tasks.py profiles --json --root /absolute/task-state --config /absolute/admin.json <<<'{}'
+```
+
+Every operation consumes one JSON object on stdin and returns one `{"ok":true,...}` or `{"ok":false,"error":...}` object. `--root` is required; use the same root/config across prepare, submit, worker and inspect. Administrator config supplies absolute `engine`, shared device identity (e.g.`metal:0`), optional ffmpeg/ffprobe and a `profiles` dictionary. Each profile supplies `model_dir`, explicit `target`, native `params`, `max_frames`, evidence/exactness metadata and **complete** dependency entries `{role,path,sha256}` for selected weights, encoders, decoders, adapters, tokenizer/config and shader files. No operational production profile or dependency hash is invented by the tool. Every configured adapter must have a pinned dependency. The native executable and relevant execution environment are pinned separately; changed dependencies fail before launch. All local roots addressing the same GPU must use the same configured device ID so the worker lock serializes them.
+
+### Prepare, submit and inspect
+
+1. `asset.register` accepts `{"path":"/absolute/source.png"}` and copies/probes pinned content into the managed content-addressed store. Subsequent task requests use opaque `asset_id`s rather than runtime paths. Native clean latent/checkpoint files are strictly probed; arbitrary files are not accepted merely because of an extension.
+2. `prepare` accepts `{"task":{"profile":"configured-ref-v1","prompt":"...","frames":124,"references":[{"asset_id":"a_...","role":"image"}],"guides":[{"asset_id":"a_...","kind":"image","frame":0}],"outputs":{"media":true,"latent":true}}}`. References are ordered. Planner resolves assets/profile, end-relative guide positions, normalized media transforms and compatibility before creating an immutable `plan_id/plan_digest`; it does not run inference. Inspect `summary`, `resolved`, transformations and quality warnings before submission.
+3. `submit` accepts only `plan_id`, `plan_digest`, and a nonempty `idempotency_key` (plus optional operation discriminator). Same key+plan returns the same job; same key with another plan fails. Submission queues work; it does not start an invisible background service.
+4. Run `worker` explicitly with the same flags and stdin `{}` to drain queued work (`{"once":true}` requests one job). Only one worker owns the device. It executes native manifests with argument arrays, not shell strings, and publishes requested validated outputs as asset IDs.
+5. `inspect` accepts `{"plan_id":"p_..."}` or `{"job_id":"j_...","cursor":0,"limit":50}`. Event pagination is bounded (maximum200); job inspection reports state, output/checkpoint IDs, failures and permitted next operations. Worker interruption yields `interrupted`, never an automatic expensive replay.
+
+### Normalization and structured intent
+
+Profiles default to versioned `standard_media_v1`: declared guide cover-crop, **reference_resize** as a separate native-reference operation, target-time resampling, audio32kHz stereo conversion and necessary right-padding. Prepare discloses actual operations and pins policy contents in the plan digest; submitting that digest approves that specific prepared execution. Optional `normalization:"require_exact"` rejects required conversions. Semantic `reference_trim`, `reference_frame_floor`, `reference_audio_trim`, and `reference_first_frame` are excluded and need explicit approval, as do overrun trim, clip reinterpretation, source selection, dropping conditioning, speech changes and internal downrender. Routine conversion policy does not silently authorize content changes.
+
+Registered media declares `media_policy:"self_contained_v1"`, an explicit demuxer, file-only protocols, canonical `frames_24` and decoded `audio_samples_32k`. Playlists and MOV external data references are rejected before probing rather than fetched implicitly. Resolved plans expose `reference_preprocessing` and `guide_spans`, including actual native-reference resize/stretch behavior, source selection and audio counts. Guide source frame indices use the canonical24fps clock **after resampling**, not the container's original frame index. This metadata makes reference preprocessing inspectable; it is not a reference-fidelity guarantee.
+
+Optional `task.intent` replaces freeform `prompt` with deterministic structured formatting. Fields are `setting`, `subjects:[{id,description,reference_ids}]`, `actions` (text or list), `camera`, `dialogue:[{speaker_id,language,text}]`, `reference_use:[{asset_id,role,relationship,use,subject_id}]`, `ambience`, `music`. A voice binding uses `use:"voice",subject_id:"person"` for an audio-bearing reference and a defined subject; dialogue speaker_id names that subject. The formatter emits the six plain-text `name:` sections from the official reference guide, stable `<Subject N>`, independently counted `<Picture N>/<Video N>/<Audio N>`, and `<d>[Chinese] …</d>` dialogue. Do not put reserved labels/delimiters inside plain structured text. It does not inspect assets, transcribe audio, infer unseen identity features or perform general semantic contradiction detection. Multiple views of one person can share one subject. Freeform input remains possible but does not receive fabricated structured guarantees.
+
+### Revision, continuation and control
+
+- `revise` creates a **new edit plan** from a job's published clean latent/media or a registered asset. Patches may change prompt/intent, references, guides, mask, start_transition and normalization, not immutable profile/shape. Registered-asset revision supplies explicit task profile and target frames. Media sources are genuinely encoded before partial-denoise generation; a revision is not an exact resume.
+- `continue` accepts job_id or asset_id, `tail_frames` (valid `17k+5`,default22), positive `additional_frames` divisible by17, explicit `audio_mode` (`condition`,`silent`,`discard`), `join_mode` (`new_segment`,`concatenated`), `assembly_policy:"explicit_reencode_no_crossfade"`, and a task containing the profile/prompt. It owns target frames and tail guides. Source must be24fps; concatenation requires matching canvas. The prepared assembly reports overlap, generated overlap discarded, final length, audio policy and join time. It is explicit re-encoding without hidden crossfade, not perfect or bit-exact generated continuity.
+- `pause` and `cancel` accept job_id; only resumable jobs can pause or retain checkpoints (`keep_checkpoint:true`). A never-started paused resumable job has no solver checkpoint; inspect reports a fresh submit route. Running resumable control is observed at completed transitions. Throughput cancellation aborts its worker-owned native process group and publishes neither partial outputs nor a checkpoint; asking to pause or keep a checkpoint produces a repair to prepare a resumable task. Repeated terminal control is idempotent.
+- `resume` accepts **only job_id** (plus operation discriminator) for a paused/interrupted/cancelled job with a durable checkpoint. It creates a new immutable prepared resume plan, to submit normally with its digest/new idempotency key. No changed intent/profile is accepted. Exact computational continuation is same-build/device/configuration behavior, not a guarantee of original source pixels, identical speech waveforms or cross-backend bitwise output.
+
+### Evidence boundary for this integration
+
+The following records describe the pre-beta5 controls/task integration. The later beta5 implementation and author-weight proof are recorded separately in [Eros beta5 setup](EROS_BETA5_SETUP.md); historical executable identities and counts below must not be relabeled as the latest beta5 build.
+
+Parent-reported final native acceptance now passed: clean compilation;1793host checks; sampler and GPU suites covering LoRA, reductions, BF16, AudioVAE and mux; real3-second standalone audio independent of22video frames; terminal callback/result and512media-versus256standalone handling; zero-mask full native equality; partial denoise; all three samplers' pause/resume byte equality and changed-prompt/same-supplied-digest rejection; and RefTurbo8 with M5rowFC2 plus mixed references/guide (observed54.613seconds for that case). Earlier mixed/timed guides, bounded selection from a600-frame source, AV/video-only encode/decode and eight malformed manifests passed. The audio-only bound fix has therefore been rerun successfully; it is no longer pending. Current native executable SHA256 is `d6209fa2212dee29f91c4d3c497beceb05e4302c8fd1bc11f8d817992daa0724`.
+
+The54.613-second mixed Turbo case establishes only schema/weight/LoRA+rowFC2 inference compatibility. Its harness used a blue-jacket adult/park guide but explicitly prompted a red fox; the output fox follows that conflicting prompt. Retain this contradictory control: it is **not** first-frame, identity or voice-adherence evidence. A separate aligned comparison subsequently generated both reference-image+reference-audio with a frame-zero guide and the same request without that guide:512×512,107frames,8-step RefTurbo,RES/simple,F32VAE,full50layers,reuse1,seed42. Both MP4s decoded successfully; visual inspection showed the referenced clothed adult and park with the requested wave. This demonstrates the exercised combined path, not exact source pixels, voice identity, lip sync, or a controlled quality improvement.
+
+Parent's two-alternated-cycle benchmark used512×512,39frames,4Euler/serving steps,full50layers,F32VAE,process-cold with filesystem cache not flushed. Median full wall seconds: old43.0846785,new humanCLI39.7442995,new machine throughput41.1369515,controlled40.984869. Old/newCLI/newmachine output MP4 hashes agreed; the two controlled outputs agreed with each other but differed from that fast-path hash, consistent with separate arithmetic paths—not a quality comparison. Two samples do not establish a general speedup, significant-regression verdict or resident warm-throughput parity. Latest detailed commands/hashes/results belong in the parent-owned verification record.
+
+Final Python planner/asset regressions against the real isolated native binary ran39tests:37passed and2inference tests skipped by that suite's explicit opt-in gate. Separate real-model task acceptance then passed prepare/submit/idempotency/inspect, actual media-only source encoding and revision, transition-boundary pause and resume, concatenated continuation, throughput generation without checkpoints, and running throughput process-group cancellation without published outputs/checkpoints. Changed-intent exact resume was rejected. These were native model executions, not fake binaries. They do not certify subjective quality, voice identity, lip-sync, long-duration stability, every approximation/checkpoint combination, or seamless generated continuity.
+
+Observed artifact records are preserved under `/Users/mics/Movies/H3-Controls-20261026/`: `native-acceptance-summary.json`, `performance-summary.json`, `task-acceptance-summary.json`, and `aligned-guide-evidence/` (both videos, manifests, logs and summary). The isolated remote run root is `/Users/tedmacbookpro/projects/h3-lora-dev-20261025T185924Z`, with `acceptance/`, `performance/`, `task-acceptance/` and `aligned-guide-evidence/`. The records retain the earlier audio-only failure alongside its passing fixed rerun, and identify per-case native executable SHA-256; the final pre-beta5 executable is `d6209fa2212dee29f91c4d3c497beceb05e4302c8fd1bc11f8d817992daa0724`. Subsequent beta5 extensions require separate verification; these results must not be relabeled as beta5 evidence.
+
+## Eros Max beta5 runtime
+
+The isolated beta5 runtime uses the author's full BF16 TURBO-hybrid source, not a renamed official transformer or an emulated ConvRot INT8 checkpoint. Native schedule preparation recognizes rank8 AdaLN/time-table curves, keeps block modulation at BF16 and final modulation/output heads at F32 with a BF16 RMSNorm boundary. Existing full-width final-head fast paths remain unchanged. Required and optional transformer inventories share discovery; optional Ref2VA accepts valid single-file checkpoints without requiring an index, while malformed/unreadable inventories fail closed.
+
+Eight pinned task presets cover text/reference × ER-SDE/beta57, RES/simple, LCM/simple and Euler/simple, without extra Turbo LoRAs or approximation caches. Real author-weight reference/image/audio/guide generation, exact native ER resume, installed-profile preparation and task pause/resume were exercised. Source/converted hashes, numerical reference commits, tested scopes, artifact paths, licensing boundaries and the preserved failing-before discovery case are in [EROS_BETA5_SETUP.md](EROS_BETA5_SETUP.md). These are implementation and exercised-path results, not universal quality, voice/lip-sync or commercial-license certification.
+
