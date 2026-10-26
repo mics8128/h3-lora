@@ -8,11 +8,11 @@ Apple Silicon 原生 MiniMax-H3 影音生成：FL2VA／Ref2VA、immutable 多 Lo
 
 ## 開發狀態與品質界線
 
-2026-10-26：依實際製作回饋重開開發。Astra 設計見 [DEVELOPMENT_DESIGN.md](DEVELOPMENT_DESIGN.md)；實作不等於已驗收人物一致性、音色、唇形或無縫接縫。既有128G部署沒有自動更新；新程式在獨立工作目錄驗證，不覆蓋正在使用的原始碼或中斷生成。
+2026-10-26：依實際製作回饋重開開發。Astra 設計見 [DEVELOPMENT_DESIGN.md](DEVELOPMENT_DESIGN.md)；實作不等於已驗收人物一致性、音色、唇形或無縫接縫。先在獨立工作目錄完成 review 與驗證，之後依使用者指示更新 128G 主目錄與 beta5 runtime；更新前確認沒有生成程序，保留原 runtime、模型與輸出。
 
 原有 Turbo／resident／BF16 有先前短片證據；新增條件與取樣狀態另作驗收。開發版已接入 beta5 的 rank-8 AdaLN 曲線與 ER-SDE／beta／beta57；這不代表任意 pruned 格式、LightVAE、ConvRot／NVFP4、Sage／TeaCache及官方未開源 Context-IR／2K 都可用。查核來源見 [加速工作流審計](ACCELERATION_WORKFLOW_AUDIT.md)、[品質搭配研究](QUALITY_PROFILE_RESEARCH.md) 與 [beta5配置／驗證](EROS_BETA5_SETUP.md)。沒有同機同條件證據，不能宣稱「7秒1080p／205秒」、「幾乎無損」或「完美續拍」。
 
-完整 fork review 已以原始 upstream `8974cc0` 為基準，修正 CLI 首尾影格、guide 音訊與相鄰判定、checkpoint 身分／前置驗證，以及 task 準備／修訂邊界；獨立 beta5 實跑的 uninterrupted/resume latent 與 MP4 hashes 相同。範圍、測試與未驗證界線見 [review 紀錄](RUNTIME_REFERENCE.md#fork-wide-review-corrections-2026-10-26)。既有部署未被替換。
+完整 fork review 已以原始 upstream `8974cc0` 為基準，修正 CLI 首尾影格、guide 音訊與相鄰判定、checkpoint 身分／前置驗證，以及 task 準備／修訂邊界；獨立 beta5 實跑的 uninterrupted/resume latent 與 MP4 hashes 相同。範圍、測試與未驗證界線見 [review 紀錄](RUNTIME_REFERENCE.md#fork-wide-review-corrections-2026-10-26)，128G 更新與回復位置見 [部署紀錄](EROS_BETA5_SETUP.md#128g-review-更新-2026-10-26)。
 
 ## 0. 小模型主要入口：JSON任務，不拼長指令
 

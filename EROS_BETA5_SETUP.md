@@ -15,7 +15,7 @@
 | 獨立 runtime | `/Users/tedmacbookpro/projects/h3-lora-eros-beta5` |
 | 任務設定 | 模型 root 下的 `h3-task-profiles.json` |
 
-原始檔保留在 `source/`，轉換紀錄為 `source/conversion-manifest.json`；實際推論使用 `FL2VA/transformer/model.safetensors`。`Ref2VA/transformer` 指向同一份 hybrid transformer。文字編碼器、tokenizer、影音 VAE 等共用官方 FL2VA 組件，**沒有以官方 transformer 的值補入作者權重**。原先正式 `/Users/tedmacbookpro/projects/h3-lora` 沒有被替換、部署或重啟。
+原始檔保留在 `source/`，轉換紀錄為 `source/conversion-manifest.json`；實際推論使用 `FL2VA/transformer/model.safetensors`。`Ref2VA/transformer` 指向同一份 hybrid transformer。文字編碼器、tokenizer、影音 VAE 等共用官方 FL2VA 組件，**沒有以官方 transformer 的值補入作者權重**。初次安裝保持正式 `/Users/tedmacbookpro/projects/h3-lora` 不變；之後依使用者指示部署 review 修正，見本文末部署紀錄。
 
 作者的[模型卡](https://civitai.red/api/v1/models/2851079)建議 beta5 預設使用 `TURBO-hybrid_int8`，其 [HF 檔案](https://huggingface.co/TenStrip/10Eros-Max/blob/main/10Eros_Max_h3_TURBO-hybrid_beta5_int8.safetensors) SHA 為 `4dd965496e5b1b83cd13c65cbe7a535b8a4d94ae768a7646b4e336d52c4781cf`。該格式有 per-row scale 與逆 Hadamard group rotation，不能用普通 `int8 × scale` 載入。本次選作者完整 BF16，避免假冒 ConvRot 支援；所有 preset 也明確停用原生 M5 的額外 INT8 MLP/QKV/attention-output 量化。這是精度／速度取捨，不是作者 INT8 工作流的速度或位元等價重現。
 
@@ -118,3 +118,15 @@ Astra 已執行設計及程式碼審查，找到並要求修正 final modulation
 - [原始 ER-SDE 論文／MIT solver](https://github.com/QinpengCui/ER-SDE-Solver/tree/25ca6c2e6b065754a55694dc6941a3259fa0f082)；完整 notice 與 Comfy GPLv3／RES4LYF AGPLv3＋額外商用限制的區分見 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。參考數值契約不是授權重授、clean-room 證明或法律清查。
 
 作者聲明適用 MiniMax H3 community license，且移入 LTX 2.3、Wan 2.2、Krea 2 的部分還受各來源條款約束。Civitai 的 allow 欄位不是整體商用或再分發權利的法律保證；本次沒有接受額外法律條款或宣告授權已完整審核。
+
+## 128G review 更新 (2026-10-26)
+
+依使用者指示，已推送並部署 review 修正 `0f96a9bd859f1576097327e2b7f46298b28d31d8`。主目錄 `/Users/tedmacbookpro/projects/h3-lora` 由 upstream 基準加舊工作區改動更新為 origin/main；beta5 runtime 從同一提交匯出來源。兩處均強制重新編譯 `h3`、`libh3.a`、host 與 sampler tests。後續文件提交不改變這次驗證的程式來源。
+
+部署前確認沒有執行中的生成程序。原主目錄與 beta5 runtime 完整 APFS clone 備份在 `/Users/tedmacbookpro/projects/h3-deploy-backup-20261026-0f96a9b/main` 與 `beta5`；任務設定亦備份在同一目錄。主目錄原本未提交的 tracked/untracked 改動另保留為 Git stash `pre-deploy-0f96a9b`。模型、既有輸出與八個 preset 參數未更動。
+
+部署後兩個實際入口各通過 5,293 host checks、sampler tests、beta/beta57 effective schedule 查詢，並以作者 beta5 執行圖片＋音訊 reference、image guide、兩步 ER-SDE/beta57 的 256×256／22-frame 生成。兩處 latent SHA-256 均為 `30a41f2aa23a6db12274801870f3839fe80ebb4ec7cb43f9f1aa34b8d66d89aa`，MP4 均為 `6c7102c015f5b4e31085af7e0dcac31991886dc38b52759a21ebaca69adb808a`，與 review acceptance 一致；FFmpeg 完整解碼通過。已安裝 task profile 查詢回報八個 preset 全部 available。
+
+主目錄執行檔 SHA-256：`11168f5316f6027e933fbd99c14d202e5b6fec1f91a7dcafb163b19808efe847`；beta5：`e5a88771f646cfc4bcc01b87011255ae10a14c78c47055b92fd37af2ba8689ab`。各 runtime 的 `outputs/deploy-0f96a9b/` 保存 manifest、JSONL、stderr、latent、MP4 與 summary；beta5 `runtime-source.json` 區分本次部署與舊版歷史 acceptance。
+
+舊 checkpoint／已準備計畫綁定舊版執行身分，不應跨版本直接恢復或提交。新工作重新 prepare；需要原版計算狀態時，先確認無工作執行，再回復對應完整 runtime 備份至原路徑，不要只換單一 executable。備份路徑直接啟動不等於已驗證的 exact resume。
