@@ -208,6 +208,7 @@ encoder小格式與LightVAE暫緩；若之後有明確容量／I/O／decoder佔�
 | 歷史設計與Astra後續建議，非自動待辦清單 | [LORA_DESIGN.md](LORA_DESIGN.md)、[TURBO_DESIGN.md](TURBO_DESIGN.md)、[ASTRA_OPTIMIZATION_PLAN.md](ASTRA_OPTIMIZATION_PLAN.md) |
 | Ref2VA來源與實際支援範圍 | [REF_COMPATIBILITY_RESEARCH.md](REF_COMPATIBILITY_RESEARCH.md) |
 | 上游PR取捨與落地狀態 | [UPSTREAM_RESEARCH.md](UPSTREAM_RESEARCH.md) |
+| Eros beta5品質優先效能結論、否決證據與Luna／Astra來源調查 | [本輪結論](eros-beta5-quality-safe-final-plan-2026-10-26.md)、[最佳已知設定](eros-beta5-best-settings-quality-safe-2026-10-26.md) |
 | 程式與第三方授權 | [LICENSE](LICENSE)、[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) |
 
 Unlocked v2.1等風格adapter屬選用實驗，不是日常必需；兩張卡片的sampler建議可能衝突，見[已記錄的組合測試](TURBO_DESIGN.md#combined-768p-smoke)。LightVAE尚未實作，不要下載後直接替換原始VAE；模型權重授權和MIT程式碼授權分開檢查。
