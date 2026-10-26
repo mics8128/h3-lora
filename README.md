@@ -12,6 +12,8 @@ Apple Silicon 原生 MiniMax-H3 影音生成：FL2VA／Ref2VA、immutable 多 Lo
 
 原有 Turbo／resident／BF16 有先前短片證據；新增條件與取樣狀態另作驗收。開發版已接入 beta5 的 rank-8 AdaLN 曲線與 ER-SDE／beta／beta57；這不代表任意 pruned 格式、LightVAE、ConvRot／NVFP4、Sage／TeaCache及官方未開源 Context-IR／2K 都可用。查核來源見 [加速工作流審計](ACCELERATION_WORKFLOW_AUDIT.md)、[品質搭配研究](QUALITY_PROFILE_RESEARCH.md) 與 [beta5配置／驗證](EROS_BETA5_SETUP.md)。沒有同機同條件證據，不能宣稱「7秒1080p／205秒」、「幾乎無損」或「完美續拍」。
 
+完整 fork review 已以原始 upstream `8974cc0` 為基準，修正 CLI 首尾影格、guide 音訊與相鄰判定、checkpoint 身分／前置驗證，以及 task 準備／修訂邊界；獨立 beta5 實跑的 uninterrupted/resume latent 與 MP4 hashes 相同。範圍、測試與未驗證界線見 [review 紀錄](RUNTIME_REFERENCE.md#fork-wide-review-corrections-2026-10-26)。既有部署未被替換。
+
 ## 0. 小模型主要入口：JSON任務，不拼長指令
 
 `tools/h3_tasks.py` 使用 Python 標準函式庫；FFmpeg／FFprobe用於素材探測與明示的媒體處理。管理者先設定 `H3_TASK_ROOT`（可寫任務目錄）、`H3_TASK_CONFIG`（引擎、device、已安裝模型／adapter與完整dependency hashes的設定檔）。所有共用同一GPU的state roots必須使用相同device ID。

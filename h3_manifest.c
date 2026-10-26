@@ -1,5 +1,6 @@
 /* Strict bounded execution manifest reader. All returned strings borrow document storage. */
 #include "h3_cli.h"
+#include "h3_host.h"
 #include <ctype.h>
 #include <errno.h>
 #include <inttypes.h>
@@ -420,6 +421,57 @@ int h3_cli_capabilities(void) {
     puts("},\"samplers\":[\"euler\",\"lcm\",\"res_multistep\",\"er_sde\"],\"schedulers\":[\"serving\",\"simple\",\"beta\",\"beta57\"],\"constraints\":{\"default_execution\":\"ordinary_throughput\",\"pause_requires_control_path\":true,\"stateful_execution\":\"explicit_control_checkpoint_initial_mask_or_resume\",\"exact_resume_requires_uncached\":true,\"resume_requires_compatible_checkpoint\":true,\"control_schema\":{\"action\":[\"run\",\"pause\",\"cancel\"]}}}");
     return 0;
 }
+static int resolve_schedule(const h3_params *p, h3_sigma_schedule *schedule) {
+    switch (p->scheduler) {
+        case H3_SCHEDULER_SERVING:
+            return h3_serving_schedule_build(p->steps, p->video_shift, p->audio_shift, schedule);
+        case H3_SCHEDULER_SIMPLE:
+            return h3_schedule_build(p->steps, p->video_shift, p->audio_shift, schedule);
+        case H3_SCHEDULER_BETA: case H3_SCHEDULER_BETA57:
+            return h3_beta_schedule_build(p->steps, p->video_shift, p->audio_shift,
+                                         p->scheduler == H3_SCHEDULER_BETA57, schedule);
+    }
+    return 0;
+}
+
+/* Planning uses the same native schedule, including beta-grid deduplication. */
+int h3_cli_schedule(const char *name, const char *steps,
+                    const char *video_shift, const char *audio_shift) {
+    h3_params p = H3_PARAMS_DEFAULT;
+    if (!strcmp(name, "serving")) p.scheduler = H3_SCHEDULER_SERVING;
+    else if (!strcmp(name, "simple")) p.scheduler = H3_SCHEDULER_SIMPLE;
+    else if (!strcmp(name, "beta")) p.scheduler = H3_SCHEDULER_BETA;
+    else if (!strcmp(name, "beta57")) p.scheduler = H3_SCHEDULER_BETA57;
+    else return fail("invalid_request", "params.scheduler", "Unknown scheduler");
+    char *end;
+    errno = 0;
+    long count = strtol(steps, &end, 10);
+    if (errno || end == steps || *end || count < 1 || count > H3_MAX_STEPS)
+        return fail("invalid_request", "params.steps", "Invalid requested transition count");
+    p.steps = (int)count;
+    const char *values[] = {video_shift, audio_shift};
+    float *shifts[] = {&p.video_shift, &p.audio_shift};
+    const char *fields[] = {"params.video_shift", "params.audio_shift"};
+    for (size_t i = 0; i < 2; i++) {
+        errno = 0;
+        *shifts[i] = strtof(values[i], &end);
+        if (errno || end == values[i] || *end || !isfinite(*shifts[i]) || *shifts[i] <= 0)
+            return fail("invalid_request", fields[i], "Shift must be positive and finite");
+    }
+    h3_sigma_schedule schedule;
+    if (!resolve_schedule(&p, &schedule))
+        return fail("invalid_request", "params.steps", "Cannot construct the native schedule");
+    printf("{\"schema_version\":1,\"requested_steps\":%d,\"transitions\":%d,\"video\":[",
+           p.steps, schedule.steps);
+    for (int i = 0; i <= schedule.steps; i++)
+        printf("%s%.9g", i ? "," : "", (double)schedule.video[i]);
+    fputs("],\"audio\":[", stdout);
+    for (int i = 0; i <= schedule.steps; i++)
+        printf("%s%.9g", i ? "," : "", (double)schedule.audio[i]);
+    puts("]}");
+    return 0;
+}
+
 #define INT_FIELD(name,min,max) do { \
     int field_node = member(d,po,#name); \
     if (field_node) p.name = integer(d,field_node,min,max); \
@@ -665,9 +717,13 @@ int h3_cli_manifest(const char *path) {
     if (op && !strcmp(op,"decode") && !p.output_path) d->failed=1;
     if (op && (!strcmp(op,"generate") || !strcmp(op,"resume"))) {
         if (!p.output_path && !p.latent_output_path) d->failed=1;
-        int terminal_decode = p.initial_latent_path && p.start_transition == p.steps;
-        if (!terminal_decode && target &&
-            ((p.reference_count != 0) != !strcmp(target,"ref2va"))) d->failed=1;
+        h3_sigma_schedule schedule;
+        if (!resolve_schedule(&p, &schedule) || p.start_transition > schedule.steps) d->failed=1;
+        else {
+            int terminal_decode = p.initial_latent_path && p.start_transition == schedule.steps;
+            if (!terminal_decode && target &&
+                ((p.reference_count != 0) != !strcmp(target,"ref2va"))) d->failed=1;
+        }
     }
     if (p.preview_denoise || p.start_transition>p.steps) d->failed=1;
     if (op && (!strcmp(op,"generate") || !strcmp(op,"resume")) &&

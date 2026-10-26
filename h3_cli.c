@@ -443,13 +443,10 @@ static int generate(h3_cli_state *state, const char *prompt) {
     }
     h3_params params = state->params;
     params.seed = state->random_seed ? random_seed() : state->params.seed;
-    h3_guide guides[130];
-    memcpy(guides, state->guides, state->guide_count * sizeof(*guides));
-    params.guides = guides;
+    params.guides = state->guides;
     params.guide_count = state->guide_count;
-    if (state->first_frame) guides[params.guide_count++] = (h3_guide){.kind=H3_GUIDE_IMAGE,.path=state->first_frame,.frame_index=0};
-    if (state->last_frame) guides[params.guide_count++] = (h3_guide){.kind=H3_GUIDE_IMAGE,.path=state->last_frame,.frame_index=params.frames-1};
-    params.first_frame = params.last_frame = NULL;
+    params.first_frame = state->first_frame;
+    params.last_frame = state->last_frame;
     params.output_path = output;
     params.preview_denoise = state->show && state->terminal != H3_TERM_NONE;
     params.on_frame = params.preview_denoise ? cli_frame : NULL;
@@ -641,8 +638,22 @@ static int process_command(h3_cli_state *state, char *line, int *repeat) {
             fprintf(stderr,"Usage: !guide-span SOURCE_START SOURCE_FRAMES (sets last guide; clips need 17k+5 frames)\n");
         else {state->guides[state->guide_count-1].source_start_frame=(int)start;state->guides[state->guide_count-1].source_frames=(int)frames;}
     } else if (!strcasecmp(command,"guide-audio-path")) {
-        if(!state->guide_count || !*argument) fprintf(stderr,"Usage: !guide-audio-path PATH (pairs last guide)\n");
-        else {char *copy=strdup(argument);if(copy){h3_guide *g=&state->guides[state->guide_count-1];free((char*)g->audio_path);g->audio_path=copy;g->include_embedded_audio=0;}}
+        if(!state->guide_count || !*argument) fprintf(stderr,"Usage: !guide-audio-path PATH (pairs last clip guide)\n");
+        else {
+            h3_guide *guide=&state->guides[state->guide_count-1];
+            if(guide->kind!=H3_GUIDE_CLIP && guide->kind!=H3_GUIDE_CLIP_AUDIO)
+                fprintf(stderr,"h3: !guide-audio-path requires a preceding clip guide\n");
+            else {
+                char *copy=strdup(argument);
+                if(!copy) fprintf(stderr,"h3: out of memory copying guide audio path\n");
+                else {
+                    free((char*)guide->audio_path);
+                    guide->audio_path=copy;
+                    guide->kind=H3_GUIDE_CLIP_AUDIO;
+                    guide->include_embedded_audio=0;
+                }
+            }
+        }
     }
     else if (!strncasecmp(command, "guide-", 6)) {
         const char *names[] = {"image", "clip", "audio", "clip-audio"};

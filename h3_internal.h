@@ -9,6 +9,7 @@
 struct h3_dit;
 struct h3_video_vae_decoder;
 struct h3_lora_stack;
+struct h3_file_digest;
 
 struct h3_ctx {
     char *model_dir;
@@ -19,6 +20,8 @@ struct h3_ctx {
     char error_field[128];
     h3_device_info device;
     h3_model_info model;
+    struct h3_file_digest *file_digests;
+    uint64_t file_digest_revision;
     int cache_enabled;
     char *conditioning_key;
     size_t conditioning_tokens;

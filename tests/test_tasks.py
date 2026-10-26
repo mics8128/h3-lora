@@ -166,6 +166,189 @@ class NativePlannerBehavior(unittest.TestCase):
         task.update(patch)
         return self.tasks.dispatch('prepare', {'task': task})
 
+    def completed_job_fixture(self, plan, outputs, key):
+        # Persisted completed-job fixture: registered media/tensors are real inputs,
+        # but no worker or inference ran to create this historical job state.
+        job = self.tasks.dispatch('submit', dict(plan_id=plan['plan_id'],
+            plan_digest=plan['plan_digest'], idempotency_key=key))
+        job.update(state='succeeded', outputs=outputs)
+        self.tasks.db.execute('UPDATE jobs SET state=?,body=? WHERE id=?',
+                              ('succeeded', h3.canonical(job), job['job_id']))
+        return job
+
+    def test_public_assembly_is_rejected_and_continuation_source_is_pinned(self):
+        with self.assertRaises(h3.TaskError) as caught:
+            self.prepare(assembly=dict(source_asset='missing'))
+        self.assertEqual('task.assembly', caught.exception.value['field'])
+        source = self.video(22)
+        request = dict(asset_id=source['asset_id'], tail_frames=5, additional_frames=17,
+            audio_mode='discard', join_mode='concatenated',
+            assembly_policy='explicit_reencode_no_crossfade', task=dict(profile='test-exact-v1'))
+        request['task']['assembly'] = {}
+        with self.assertRaises(h3.TaskError) as caught:
+            self.tasks.dispatch('continue', request)
+        self.assertEqual('task.assembly', caught.exception.value['field'])
+        del request['task']['assembly']
+        plan = self.tasks.dispatch('continue', request)
+        self.assertNotIn('assembly', plan['intent'])
+        self.assertEqual(source['asset_id'], plan['resolved']['assembly']['source_asset'])
+        self.assertIn(source['asset_id'], [a['asset_id'] for a in plan['resolved']['assets']])
+        Path(source['path']).chmod(0o644)  # Simulate external tampering of managed bytes.
+        Path(source['path']).write_bytes(b'changed pinned source')
+        with self.assertRaises(h3.TaskError) as caught:
+            self.tasks.dispatch('submit', dict(plan_id=plan['plan_id'], plan_digest=plan['plan_digest'], idempotency_key='changed-source'))
+        self.assertEqual('dependency_changed', caught.exception.value['code'])
+
+    def test_multiframe_image_guide_requires_first_frame_selection(self):
+        source = self.video(22)
+        guide = dict(asset_id=source['asset_id'], kind='image')
+        for policy in ('require_exact', 'standard_media_v1'):
+            with self.subTest(policy=policy):
+                with self.assertRaises(h3.TaskError) as caught:
+                    self.prepare(guides=[guide], normalization=policy)
+                self.assertEqual('guide_first_frame', caught.exception.value['details']['transformation']['kind'])
+        plan = self.prepare(guides=[guide], normalization=['guide_first_frame'])
+        self.assertEqual({'source_frames': 22}, plan['transformations'][0]['requested'])
+        span = plan['resolved']['guide_spans'][0]
+        self.assertEqual(22, span['asset_source_frames'])
+        self.assertEqual(1, span['source_frames'])
+        single = self.prepare(guides=[dict(asset_id=self.image(), kind='image')], normalization='require_exact')
+        self.assertEqual([], single['transformations'])
+
+    def test_revision_preserves_profile_snapshot_and_refreshes_pinned_availability(self):
+        path = self.root / 'clean.native'
+        native_av_latent(path)
+        latent = self.tasks.dispatch('asset.register', {'path': str(path)})
+        plan = self.prepare()
+        job = self.completed_job_fixture(plan, {'latent': latent['asset_id']}, 'profile-snapshot')
+        self.config['profiles']['test-exact-v1']['params'].update(width=512, height=512, steps=7)
+        revised = self.tasks.dispatch('revise', dict(job_id=job['job_id'], patch=dict(prompt='Changed.')))
+        params = revised['resolved']['manifest']['params']
+        self.assertEqual((256, 256, 2, 22), (params['width'], params['height'], params['steps'], params['frames']))
+        self.assertTrue(revised['submittable'])
+        dependency = Path(plan['resolved']['profile']['dependencies'][0]['path'])
+        dependency.write_bytes(b'changed inventory')
+        unavailable = self.tasks.dispatch('revise', dict(job_id=job['job_id'], patch=dict(prompt='Changed again.')))
+        self.assertFalse(unavailable['submittable'])
+        self.assertEqual('digest_mismatch', unavailable['summary']['missing'][0]['reason'])
+        with self.assertRaises(h3.TaskError) as caught:
+            self.tasks.dispatch('submit', dict(plan_id=revised['plan_id'], plan_digest=revised['plan_digest'], idempotency_key='changed-profile-dependency'))
+        self.assertEqual('dependency_changed', caught.exception.value['code'])
+
+    def test_reference_image_size_uses_canonical_native_strings(self):
+        self.config['profiles']['test-exact-v1']['target'] = 'ref2va'
+        reference = dict(asset_id=self.image(512, 256), role='image')
+        for value, canvas in [('match', [352, 192]), ('max', [512, 256])]:
+            self.config['profiles']['test-exact-v1']['params']['reference_image_size'] = value
+            plan = self.prepare(references=[reference])
+            self.assertEqual(value, plan['resolved']['manifest']['params']['reference_image_size'])
+            self.assertEqual(canvas, plan['resolved']['reference_preprocessing'][0]['canvas'])
+        for value in (0, 1, True):
+            self.config['profiles']['test-exact-v1']['params']['reference_image_size'] = value
+            with self.subTest(value=value):
+                with self.assertRaises(h3.TaskError) as caught:
+                    self.prepare(references=[reference])
+                self.assertEqual('profile_incompatible', caught.exception.value['code'])
+
+    def test_native_reference_total_and_modality_boundaries(self):
+        self.config['profiles']['test-exact-v1']['target'] = 'ref2va'
+        image = dict(asset_id=self.image(), role='image')
+        video = dict(asset_id=self.video(56)['asset_id'], role='video')
+        path = self.root / 'two-seconds.wav'
+        with wave.open(str(path), 'wb') as output:
+            output.setnchannels(2)
+            output.setsampwidth(2)
+            output.setframerate(32000)
+            output.writeframes(b'\0' * 64000 * 4)
+        audio = dict(asset_id=self.tasks.dispatch('asset.register', {'path': str(path)})['asset_id'], role='audio')
+        paired = dict(video, role='video_audio', audio_asset_id=audio['asset_id'])
+        for refs in ([audio] * 3, [image] * 9, [video] * 3, [image] * 9 + [video] * 3,
+                     [paired] * 3):
+            with self.subTest(valid=refs):
+                self.assertTrue(self.prepare(frames=56, references=refs, normalization=['audio_right_pad'])['submittable'])
+        for refs in ([audio] * 4, [image] * 10, [video] * 4, [image] * 9 + [video] * 3 + [audio],
+                     [paired] * 3 + [audio]):
+            with self.subTest(invalid=refs):
+                with self.assertRaises(h3.TaskError) as caught:
+                    self.prepare(frames=56, references=refs, normalization=['audio_right_pad'])
+                self.assertEqual('invalid_request', caught.exception.value['code'])
+                self.assertEqual('task.references', caught.exception.value['field'])
+
+    def test_ref2va_requires_references_except_terminal_clean_decode(self):
+        self.config['profiles']['test-exact-v1']['target'] = 'ref2va'
+        with self.assertRaises(h3.TaskError) as caught:
+            self.prepare()
+        self.assertEqual('profile_incompatible', caught.exception.value['code'])
+        path = self.root / 'terminal-clean.native'
+        native_av_latent(path)
+        source = self.tasks.dispatch('asset.register', {'path': str(path)})
+        terminal = self.prepare(initial_latent=source['asset_id'], start_transition=2)
+        self.assertTrue(terminal['submittable'])
+        with self.assertRaises(h3.TaskError) as caught:
+            self.prepare(initial_latent=source['asset_id'], start_transition=1)
+        self.assertEqual('profile_incompatible', caught.exception.value['code'])
+
+    def test_beta_edit_bounds_use_native_effective_transition_count(self):
+        path = self.root / 'beta-clean.native'
+        native_av_latent(path)
+        source = self.tasks.dispatch('asset.register', {'path': str(path)})
+        profile = self.config['profiles']['test-exact-v1']
+        profile['params']['steps'] = 1000
+        for scheduler, terminal in [('beta', 847), ('beta57', 815)]:
+            with self.subTest(scheduler=scheduler):
+                profile['params']['scheduler'] = scheduler
+                profile['target'] = 'fl2va'
+                partial = self.prepare(initial_latent=source['asset_id'], start_transition=terminal - 1)
+                self.assertEqual(terminal - 1, partial['resolved']['manifest']['params']['start_transition'])
+                profile['target'] = 'ref2va'
+                plan = self.prepare(initial_latent=source['asset_id'], start_transition=terminal)
+                self.assertTrue(plan['submittable'])
+                self.assertEqual(terminal, plan['resolved']['manifest']['params']['start_transition'])
+                for invalid in (-1, terminal + 1, 1000):
+                    with self.subTest(start_transition=invalid):
+                        with self.assertRaises(h3.TaskError) as caught:
+                            self.prepare(initial_latent=source['asset_id'], start_transition=invalid)
+                        self.assertEqual('invalid_request', caught.exception.value['code'])
+                        self.assertEqual('task.start_transition', caught.exception.value['field'])
+
+    def test_concatenated_completed_job_fixture_revises_published_media_not_segment_latent(self):
+        source = self.video(22)
+        continuation = self.tasks.dispatch('continue', dict(asset_id=source['asset_id'], tail_frames=5,
+            additional_frames=17, audio_mode='silent', join_mode='concatenated',
+            assembly_policy='explicit_reencode_no_crossfade', task=dict(profile='test-exact-v1')))
+        media_path = self.root / 'published-39.mp4'
+        subprocess.run(['ffmpeg', '-v', 'error', '-y', '-f', 'lavfi', '-i', 'color=c=blue:s=256x256:r=24',
+            '-f', 'lavfi', '-i', 'anullsrc=r=32000:cl=stereo', '-frames:v', '39', '-t', '1.625',
+            '-c:v', 'libx264', '-c:a', 'aac', str(media_path)], check=True)
+        media = self.tasks.dispatch('asset.register', {'path': str(media_path)})
+        latent_path = self.root / 'segment-22.native'
+        native_av_latent(latent_path)
+        latent = self.tasks.dispatch('asset.register', {'path': str(latent_path)})
+        job = self.completed_job_fixture(continuation, {'media': media['asset_id'], 'latent': latent['asset_id']}, 'concatenated-fixture')
+        for policy in ('require_exact', 'standard_media_v1'):
+            with self.subTest(policy=policy):
+                with self.assertRaises(h3.TaskError) as caught:
+                    self.tasks.dispatch('revise', dict(job_id=job['job_id'], patch=dict(normalization=policy)))
+                self.assertEqual('encode_source', caught.exception.value['details']['transformation']['kind'])
+        revised = self.tasks.dispatch('revise', dict(job_id=job['job_id'], patch=dict(normalization=['encode_source'])))
+        self.assertEqual(39, revised['summary']['frames'])
+        self.assertEqual(media['asset_id'], revised['resolved']['encode_source']['asset_id'])
+        self.assertIsNone(revised['resolved']['assembly'])
+        latent_only = self.completed_job_fixture(continuation, {'latent': latent['asset_id']}, 'segment-only-fixture')
+        inspected = self.tasks.dispatch('inspect', {'job_id': latent_only['job_id']})
+        self.assertIn('revise', inspected['next_operations'])
+        segment = self.tasks.dispatch('revise', dict(job_id=latent_only['job_id'], patch=dict(prompt='Revise the generated segment.')))
+        self.assertEqual(22, segment['summary']['frames'])
+        self.assertEqual(latent['asset_id'], segment['intent']['initial_latent'])
+        self.assertEqual(latent['path'], segment['resolved']['manifest']['params']['initial_latent_path'])
+        self.assertIsNone(segment['resolved']['encode_source'])
+        self.assertIsNone(segment['resolved']['assembly'])
+        no_audio = self.video(39)
+        job = self.completed_job_fixture(continuation, {'media': no_audio['asset_id'], 'latent': latent['asset_id']}, 'silent-fixture')
+        with self.assertRaises(h3.TaskError) as caught:
+            self.tasks.dispatch('revise', dict(job_id=job['job_id'], patch=dict(normalization=['encode_source'])))
+        self.assertEqual('latent_incompatible', caught.exception.value['code'])
+
     def test_canonical_plan_identity_and_snapshot_survive_config_edits(self):
         first = self.prepare()
         same = self.prepare()
@@ -387,6 +570,16 @@ class NativePlannerBehavior(unittest.TestCase):
         self.assertIn('<Video 1>: attribute_transfer', prompt)
         self.assertNotIn('<Audio 2> <Video 1>: fully_copy', prompt)
         self.assertNotIn('<Audio 2> <Video 1>: attribute_transfer', prompt)
+        for role in ('video', 'video_audio'):
+            embedded = dict(asset_id=paired, role=role, include_embedded_audio=True)
+            approval = ['audio_resample', 'audio_right_pad', 'reference_audio_trim']
+            boundary = self.prepare(frames=56, references=[embedded] * 3, normalization=approval)
+            self.assertTrue(boundary['submittable'])
+            with self.subTest(role=role):
+                with self.assertRaises(h3.TaskError) as caught:
+                    self.prepare(frames=56, references=[embedded] * 3 + [dict(asset_id=sound, role='audio')], normalization=approval)
+                self.assertEqual('invalid_request', caught.exception.value['code'])
+                self.assertEqual('task.references', caught.exception.value['field'])
 
     def video(self, frames, fps=24):
         source = self.root / f'video-{frames}-{fps}.mp4'
@@ -556,7 +749,7 @@ class NativePlannerBehavior(unittest.TestCase):
 
 @unittest.skipUnless(os.environ.get('H3_TASK_INFERENCE_CONFIG'), 'requires explicit real-model inference approval/config')
 class RealMediaRevision(unittest.TestCase):
-    def test_media_only_concatenated_output_is_revised_at_published_not_generation_length(self):
+    def test_both_outputs_concatenated_output_is_revised_at_published_not_generation_length(self):
         with tempfile.TemporaryDirectory() as directory:
             config = json.loads(Path(os.environ['H3_TASK_INFERENCE_CONFIG']).read_text())
             profile = os.environ['H3_TASK_INFERENCE_PROFILE']
@@ -571,17 +764,21 @@ class RealMediaRevision(unittest.TestCase):
             continued = tasks.dispatch('continue', dict(job_id=job['job_id'], tail_frames=5,
                 additional_frames=17, audio_mode='condition', join_mode='concatenated',
                 assembly_policy='explicit_reencode_no_crossfade',
-                task=dict(profile=profile, prompt='The sphere remains on the table.', outputs={'media': True})))
+                task=dict(profile=profile, prompt='The sphere remains on the table.', outputs={'media': True, 'latent': True})))
             joined = tasks.dispatch('submit', dict(plan_id=continued['plan_id'], plan_digest=continued['plan_digest'], idempotency_key='joined'))
             tasks.dispatch('worker', {'once': True})
             published = tasks.dispatch('inspect', {'job_id': joined['job_id']})
             self.assertEqual('succeeded', published['state'], published.get('failure'))
+            self.assertIn('latent', published['outputs'])
+            self.assertIn('media', published['outputs'])
             self.assertEqual(22, continued['summary']['frames'])
             revised = tasks.dispatch('revise', dict(job_id=joined['job_id'], patch=dict(
                 prompt='A blue sphere rests on the same plain white table.', start_transition=1,
-                normalization=['encode_source'])))
+                # Keep approval for the inherited five-frame audio guide's clock rounding/padding.
+                normalization=['encode_source', 'time_resample', 'audio_right_pad'])))
             self.assertEqual(39, revised['intent']['frames'])
             self.assertEqual(39, revised['resolved']['manifest']['params']['frames'])
+            self.assertEqual(published['outputs']['media'], revised['resolved']['encode_source']['asset_id'])
             self.assertEqual('resumable', revised['resolved']['execution_mode'])
             child = tasks.dispatch('submit', dict(plan_id=revised['plan_id'], plan_digest=revised['plan_digest'], idempotency_key='revision'))
             tasks.dispatch('worker', {'once': True})

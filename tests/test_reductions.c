@@ -61,8 +61,12 @@ static void gqa(h3_gpu *gpu, uint32_t sequence) {
             gpu, out, tq, tk, tv, sequence, QH, KH, DIM, 1.0f) &&
             h3_gpu_submit(gpu) && h3_gpu_tensor_read_bf16(out, actual, qn), "GQA execution");
         float maximum_error = 0.0f;
-        for (size_t i = 0; i < qn; i++)
-            maximum_error = fmaxf(maximum_error, fabsf(f32(actual[i]) - expected[i]));
+        for (size_t i = 0; i < qn; i++) {
+            float decoded = f32(actual[i]);
+            require(isfinite(decoded), "GQA output must be finite");
+            require(isfinite(expected[i]), "GQA oracle output must be finite");
+            maximum_error = fmaxf(maximum_error, fabsf(decoded - expected[i]));
+        }
         if (maximum_error > 0.004f)
             fprintf(stderr, "GQA sequence=%u repeat=%d max-error=%g\n", sequence, repeat, maximum_error);
         require(maximum_error <= 0.004f, "causal GQA disagrees with independent softmax oracle");
@@ -114,7 +118,11 @@ static void group_norm(h3_gpu *gpu) {
             gpu, out, x, w, b, 1, DEPTH, HEIGHT, WIDTH, CHANNELS, GROUPS, 1e-6f) &&
             h3_gpu_submit(gpu) && h3_gpu_tensor_read_f32(out, actual, COUNT), "group norm execution");
         float maximum_error = 0.0f;
-        for (size_t i = 0; i < COUNT; i++) maximum_error = fmaxf(maximum_error, fabsf(actual[i] - expected[i]));
+        for (size_t i = 0; i < COUNT; i++) {
+            require(isfinite(actual[i]), "group norm output must be finite");
+            require(isfinite(expected[i]), "group norm oracle output must be finite");
+            maximum_error = fmaxf(maximum_error, fabsf(actual[i] - expected[i]));
+        }
         if (maximum_error > 1e-4f) fprintf(stderr, "group norm repeat=%d max-error=%g\n", repeat, maximum_error);
         require(maximum_error <= 1e-4f, "group norm/SiLU disagrees with independent oracle");
         if (!repeat) memcpy(first, actual, COUNT * sizeof(float));

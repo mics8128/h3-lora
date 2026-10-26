@@ -334,6 +334,12 @@ static int h3_frame_grid(int latent_h, int latent_w, h3_position **positions,
     return 1;
 }
 
+/* Guide adjacency is an integer-frame decision, not a model-time rounding. */
+static int64_t h3_video_span_frames(int latent_t) {
+    return INT64_C(17) * (latent_t / 5) +
+        (latent_t % 5 ? 4 * (latent_t % 5) - 3 : 0);
+}
+
 static double h3_video_span_sum(int latent_t) {
     double sum = 0.0;
     for (int index = 0; index < latent_t; index++) {
@@ -448,8 +454,8 @@ int h3_layout_build(const h3_layout_spec *spec, h3_layout *layout,
         }
         for (size_t j = 0; j < i; j++) {
             const h3_layout_guide *p = &spec->guides[j];
-            double gd=g->frame_count==1 ? 1.0 : h3_video_span_sum(g->latent_t)/h3_frame_rescale;
-            double pd=p->frame_count==1 ? 1.0 : h3_video_span_sum(p->latent_t)/h3_frame_rescale;
+            int64_t gd = g->frame_count == 1 ? 1 : h3_video_span_frames(g->latent_t);
+            int64_t pd = p->frame_count == 1 ? 1 : h3_video_span_frames(p->latent_t);
             int video_overlap = g->latent_t && p->latent_t &&
                 g->frame_index < p->frame_index + pd && p->frame_index < g->frame_index + gd;
             double ga = g->frame_index * (40.0/24.0), pa = p->frame_index * (40.0/24.0);

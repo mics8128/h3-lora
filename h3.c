@@ -34,11 +34,74 @@ static char h3_global_error[512];
 static char h3_global_error_code[64];
 static char h3_global_error_field[128];
 static h3_result *h3_decode_latent_output(h3_ctx *,const char *,int,const h3_params *,int,int);
+typedef struct h3_file_digest {
+    struct h3_file_digest *next;
+    char *path;
+    struct stat signature;
+    char hex[65];
+} h3_file_digest;
+
+static int h3_same_file(const struct stat *a, const struct stat *b) {
+    return a->st_dev == b->st_dev && a->st_ino == b->st_ino &&
+        a->st_size == b->st_size &&
+        a->st_mtimespec.tv_sec == b->st_mtimespec.tv_sec &&
+        a->st_mtimespec.tv_nsec == b->st_mtimespec.tv_nsec &&
+        a->st_ctimespec.tv_sec == b->st_ctimespec.tv_sec &&
+        a->st_ctimespec.tv_nsec == b->st_ctimespec.tv_nsec;
+}
+
+static const char *h3_file_hash(h3_ctx *ctx, const char *path) {
+    struct stat before, after, named;
+    if (stat(path, &before) || !S_ISREG(before.st_mode)) return NULL;
+    h3_file_digest *entry = ctx->file_digests;
+    for (; entry; entry = entry->next)
+        if (!strcmp(entry->path, path)) break;
+    if (entry && h3_same_file(&before, &entry->signature)) return entry->hex;
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return NULL;
+    int ok = !fstat(fd, &after) && h3_same_file(&before, &after);
+    CC_SHA256_CTX hash;
+    CC_SHA256_Init(&hash);
+    unsigned char buffer[65536], digest[32];
+    off_t total = 0;
+    while (ok) {
+        ssize_t n = read(fd, buffer, sizeof(buffer));
+        if (n < 0 && errno == EINTR) continue;
+        if (n < 0) { ok = 0; break; }
+        if (!n) break;
+        total += n;
+        CC_SHA256_Update(&hash, buffer, (CC_LONG)n);
+    }
+    ok = ok && total == before.st_size && !fstat(fd, &after) &&
+        h3_same_file(&before, &after) && !stat(path, &named) &&
+        h3_same_file(&before, &named);
+    close(fd);
+    if (!ok) return NULL;
+    CC_SHA256_Final(digest, &hash);
+    if (!entry) {
+        entry = calloc(1, sizeof(*entry));
+        if (!entry) return NULL;
+        entry->path = strdup(path);
+        if (!entry->path) { free(entry); return NULL; }
+        entry->next = ctx->file_digests;
+        ctx->file_digests = entry;
+    }
+    entry->signature = before;
+    ctx->file_digest_revision++;
+    static const char digits[] = "0123456789abcdef";
+    for (size_t i = 0; i < sizeof(digest); i++) {
+        entry->hex[2*i] = digits[digest[i] >> 4];
+        entry->hex[2*i+1] = digits[digest[i] & 15];
+    }
+    entry->hex[64] = 0;
+    return entry->hex;
+}
 
 typedef struct {
     char *text;
     size_t length;
     size_t capacity;
+    h3_ctx *content_ctx;
 } h3_key;
 
 static void h3_conditioning_cache_clear(h3_ctx *ctx) {
@@ -146,19 +209,28 @@ static int h3_key_append(h3_key *key, const char *format, ...) {
 
 static int h3_key_file(h3_key *key, const char *role, const char *path) {
     if (!path) return h3_key_append(key, "|%s=none", role);
+    if (key->content_ctx) {
+        const char *hash = h3_file_hash(key->content_ctx, path);
+        return hash && h3_key_append(key, "|%s=%zu:%s:sha256=%s", role,
+                                    strlen(path), path, hash);
+    }
     struct stat status;
     if (stat(path, &status) != 0)
         return h3_key_append(key, "|%s=%zu:%s:missing", role,
                              strlen(path), path);
-    return h3_key_append(key, "|%s=%zu:%s:%lld:%lld:%ld", role, strlen(path),
+    return h3_key_append(key, "|%s=%zu:%s:%lld:%lld:%ld:%lld:%ld:%llu:%llu", role, strlen(path),
                          path, (long long)status.st_size,
                          (long long)status.st_mtimespec.tv_sec,
-                         status.st_mtimespec.tv_nsec);
+                         status.st_mtimespec.tv_nsec,
+                         (long long)status.st_ctimespec.tv_sec,
+                         status.st_ctimespec.tv_nsec,
+                         (unsigned long long)status.st_dev,
+                         (unsigned long long)status.st_ino);
 }
 
 static int h3_key_model_tree(h3_key *key,const char *path,int depth) {
     struct stat st;
-    if (depth>32 || stat(path,&st)!=0) return h3_key_file(key,"model",path);
+    if (depth>32 || stat(path,&st)!=0) return 0;
     if (!S_ISDIR(st.st_mode)) return h3_key_file(key,"model",path);
     struct dirent **entries=NULL; int n=scandir(path,&entries,NULL,alphasort);
     if(n<0)return 0;
@@ -186,30 +258,9 @@ static int h3_key_executable(h3_key *key) {
         if(!path)return 0;
         if(_NSGetExecutablePath(path,&size)!=0) {free(path);return 0;}
     }
-    int fd=open(path,O_RDONLY|O_CLOEXEC);
-    if(path!=local)free(path);
-    if(fd<0)return 0;
-    CC_SHA256_CTX hash;
-    CC_SHA256_Init(&hash);
-    unsigned char buffer[65536],digest[CC_SHA256_DIGEST_LENGTH];
-    int ok=1;
-    for(;;) {
-        ssize_t count=read(fd,buffer,sizeof(buffer));
-        if(count<0 && errno==EINTR)continue;
-        if(count<0) {ok=0;break;}
-        if(!count)break;
-        CC_SHA256_Update(&hash,buffer,(CC_LONG)count);
-    }
-    close(fd);
-    if(!ok)return 0;
-    CC_SHA256_Final(digest,&hash);
-    static const char digits[]="0123456789abcdef";
-    char hex[CC_SHA256_DIGEST_LENGTH*2+1];
-    for(size_t i=0;i<sizeof(digest);i++) {
-        hex[2*i]=digits[digest[i]>>4];hex[2*i+1]=digits[digest[i]&15];
-    }
-    hex[sizeof(hex)-1]=0;
-    return h3_key_append(key,"|executable-sha256=%s",hex);
+    int ok = h3_key_file(key, "executable", path);
+    if (path != local) free(path);
+    return ok;
 }
 
 static int h3_compare_strings(const void *a,const void *b) {
@@ -226,9 +277,9 @@ static int h3_key_environment(h3_key *key) {
     free(items);return ok;
 }
 
-static char *h3_conditioning_key(const char *model_identity,const char *prompt, const h3_params *params,
+static char *h3_conditioning_key(h3_ctx *content_ctx, const char *model_identity,const char *prompt, const h3_params *params,
                                  int render_width, int render_height, int ref2va) {
-    h3_key key = {0};
+    h3_key key = {.content_ctx = content_ctx};
     if (!h3_key_append(&key, "mode=%d|prompt=%zu:%s", ref2va,
                        strlen(prompt), prompt)) goto failed;
     if (!h3_key_append(&key,"|models=%s",model_identity)) goto failed;
@@ -305,6 +356,25 @@ static char *h3_prepared_key(const h3_ctx *ctx, const char *conditioning,
         return NULL;
     }
     return key.text;
+}
+
+/* Adapter identity describes its immutable, already-loaded tensor snapshot. */
+static int h3_exact_digest(h3_ctx *ctx, const char *prompt, const h3_params *params,
+        int width, int height, int ref2va, const char *const paths[6], unsigned char digest[32]) {
+    h3_key models = {.content_ctx = ctx};
+    int ok = 1;
+    for (size_t i = 0; i < 6 && ok; i++) ok = h3_key_model_tree(&models, paths[i], 0);
+    ok = ok && h3_key_file(&models, "shader", "h3_shaders.metal") &&
+        h3_key_environment(&models) && h3_key_executable(&models);
+    char *conditioning = ok ? h3_conditioning_key(ctx, models.text, prompt, params,
+                                                width, height, ref2va) : NULL;
+    char *prepared = conditioning ? h3_prepared_key(ctx, conditioning, params, width, height) : NULL;
+    h3_key identity = {0};
+    ok = prepared && h3_key_append(&identity, "%s|native=%s|build=%s %s|digest=%s",
+        prepared, H3_VERSION, __DATE__, __TIME__, params->request_digest ? params->request_digest : "");
+    if (ok) CC_SHA256(identity.text, (CC_LONG)identity.length, digest);
+    free(identity.text); free(prepared); free(conditioning); free(models.text);
+    return ok;
 }
 
 static char *h3_resident_key(const h3_ctx *ctx, const h3_params *params,
@@ -633,6 +703,12 @@ void h3_free(h3_ctx *ctx) {
     if (!ctx) return;
     h3_cache_clear(ctx);
     h3_lora_stack_free(ctx->loras);
+    while (ctx->file_digests) {
+        h3_file_digest *entry = ctx->file_digests;
+        ctx->file_digests = entry->next;
+        free(entry->path);
+        free(entry);
+    }
     free(ctx->model_dir);
     free(ctx);
 }
@@ -1284,14 +1360,28 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
         "Ref2VA/video_vae/source" : "FL2VA/video_vae/source");
     char *audio_vae_path = h3_path(ctx->model_dir, ref2va ?
         "Ref2VA/audio_vae" : "FL2VA/audio_vae");
+    /* Preserve source/../ exactly: source may be a symlink, so lexical
+     * normalization would fingerprint a different file than the VAE reads. */
+    char *vae_config_path = vae_path ? h3_path(vae_path,"../config.json") : NULL;
     if (!tokenizer_path || !text_path || !dit_path || !vae_path ||
-        !audio_vae_path) {
+        !audio_vae_path || !vae_config_path) {
         h3_set_error(ctx, "out of memory resolving generation model paths");
         goto cleanup;
     }
     char detail[512]={0};
     size_t expected_video=(size_t)24*temporal.video_t*latent_h*latent_w;
     size_t expected_audio=(size_t)64*temporal.audio_t;
+    int controlled=params->initial_latent_path || params->resume_path ||
+        params->checkpoint_path || params->on_transition;
+    h3_sampler_config config={0};
+    const char *dependency_paths[6]={tokenizer_path,text_path,dit_path,vae_path,audio_vae_path,vae_config_path};
+    uint64_t dependency_revision=0;
+    if (params->resume_path) {
+        struct stat checkpoint;
+        if (stat(params->resume_path,&checkpoint) || !S_ISREG(checkpoint.st_mode) || checkpoint.st_size < 136) {
+            h3_set_error(ctx,"checkpoint_incompatible: missing or truncated sampler state");goto cleanup;
+        }
+    }
     if (params->initial_latent_path &&
         (!h3_latent_load(params->initial_latent_path,&initial,detail,sizeof(detail)) ||
          initial.video_count!=expected_video || initial.audio_count!=expected_audio ||
@@ -1319,14 +1409,34 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
         result=h3_decode_latent_output(ctx,params->initial_latent_path,0,params,
             params->width,params->height);goto cleanup;
     }
-    h3_key models={0};
-    if(!h3_key_model_tree(&models,ctx->model_dir,0) ||
+    if (controlled) {
+        config.kind=params->sampler; config.schedule=sigmas;
+        config.video_shift=params->video_shift; config.audio_shift=params->audio_shift;
+        config.seed=params->seed; config.start_step=params->start_transition;
+        config.video_count=expected_video; config.audio_count=expected_audio;
+        if (!h3_exact_digest(ctx,prompt,params,render_width,render_height,ref2va,
+                             dependency_paths,config.request_digest)) {
+            h3_set_error(ctx,"dependency_changed: cannot fingerprint exact checkpoint dependencies");goto cleanup;
+        }
+        dependency_revision=ctx->file_digest_revision;
+        if (params->resume_path) {
+            sampler_state=h3_sampler_state_load(params->resume_path,&config,detail,sizeof(detail));
+            if (!sampler_state) {h3_set_error(ctx,"checkpoint_incompatible: %s",detail);goto cleanup;}
+        }
+    }
+    h3_key models={.content_ctx=controlled ? ctx : NULL};
+    int models_ok=1;
+    if (controlled) {
+        for (size_t i=0;i<6 && models_ok;i++)
+            models_ok=h3_key_model_tree(&models,dependency_paths[i],0);
+    } else models_ok=h3_key_model_tree(&models,ctx->model_dir,0);
+    if(!models_ok ||
         !h3_key_file(&models,"shader","h3_shaders.metal") || !h3_key_environment(&models)) {
         free(models.text);h3_set_error(ctx,"out of memory fingerprinting model execution dependencies");goto cleanup;
     }
     model_identity=models.text;
     conditioning_key = h3_conditioning_key(
-        model_identity, prompt, params, render_width, render_height, ref2va);
+        controlled ? ctx : NULL, model_identity, prompt, params, render_width, render_height, ref2va);
     if (!conditioning_key) {
         h3_set_error(ctx, "out of memory constructing conditioning cache key");
         goto cleanup;
@@ -2033,32 +2143,23 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     h3_rng_seed(&audio_rng, params->seed);
     h3_rng_fill_normal(&video_rng, video, video_count);
     h3_rng_fill_normal(&audio_rng, audio, audio_count);
-    int controlled=params->initial_latent_path || params->resume_path ||
-        params->checkpoint_path || params->on_transition;
     int denoised=0;
     if (controlled) {
-        h3_sampler_config config={0}; config.kind=params->sampler; config.schedule=sigmas;
-        config.video_shift=params->video_shift; config.audio_shift=params->audio_shift;
-        config.seed=params->seed; config.start_step=params->start_transition;
-        config.video_count=video_count; config.audio_count=audio_count;
-        h3_key identity={0};
-        if (!h3_key_append(&identity,"%s|native=%s|build=%s %s|model=%s|digest=%s",prepared_key,
-                H3_VERSION,__DATE__,__TIME__,ctx->model_dir,params->request_digest ? params->request_digest : "")) {
-            free(identity.text); h3_set_error(ctx,"out of memory computing checkpoint identity"); goto cleanup;
+        unsigned char current_digest[32];
+        if (video_count!=config.video_count || audio_count!=config.audio_count ||
+            !h3_exact_digest(ctx,prompt,params,render_width,render_height,ref2va,
+                             dependency_paths,current_digest) ||
+            ctx->file_digest_revision!=dependency_revision ||
+            memcmp(current_digest,config.request_digest,sizeof(current_digest))) {
+            h3_set_error(ctx,"dependency_changed: exact checkpoint dependencies changed during preparation");goto cleanup;
         }
-        if(!h3_key_executable(&identity)) {
-            free(identity.text);
-            h3_set_error(ctx,"dependency_changed: cannot fingerprint the executable for exact checkpoint identity");
-            goto cleanup;
-        }
-        CC_SHA256(identity.text,(CC_LONG)identity.length,config.request_digest); free(identity.text);
         if (params->initial_latent_path) {
             float sv=initial_video_sigma, sa=initial_audio_sigma;
             for (size_t i=0;i<video_count;i++) video[i]=(1-sv)*initial.video[i]+sv*video[i];
             for (size_t i=0;i<audio_count;i++) audio[i]=(1-sa)*initial.audio[i]+sa*audio[i];
         }
-        sampler_state=params->resume_path ? h3_sampler_state_load(params->resume_path,&config,detail,sizeof(detail)) :
-            h3_sampler_state_start(&config,video,audio,initial.video,masks.video,initial.audio,masks.audio,detail,sizeof(detail));
+        if (!sampler_state)
+            sampler_state=h3_sampler_state_start(&config,video,audio,initial.video,masks.video,initial.audio,masks.audio,detail,sizeof(detail));
         if (!sampler_state) { h3_set_error(ctx,"checkpoint_incompatible: %s",detail); goto cleanup; }
         h3_transition_control control={params,sigmas.steps,0};
         denoised=h3_dit_denoise_state(dit,sampler_state,sigmas.steps,h3_dit_progress_bridge,&progress,
@@ -2066,6 +2167,12 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
             h3_transition_observe,&control,detail,sizeof(detail));
         int action=control.action;
         if(action) denoised=1; /* Observer stopped only after a committed transition. */
+        if (denoised && (!h3_exact_digest(ctx,prompt,params,render_width,render_height,ref2va,
+                                         dependency_paths,current_digest) ||
+                         ctx->file_digest_revision!=dependency_revision ||
+                         memcmp(current_digest,config.request_digest,sizeof(current_digest)))) {
+            h3_set_error(ctx,"dependency_changed: exact checkpoint dependencies changed during sampling");goto cleanup;
+        }
         if (denoised && params->checkpoint_path &&
             !h3_sampler_state_save(sampler_state,params->checkpoint_path,detail,sizeof(detail))) {
             h3_set_error(ctx,"output_failed: checkpoint: %s",detail); goto cleanup;
@@ -2225,6 +2332,7 @@ cleanup:
     free(model_identity);
     free(tokenizer_path); free(text_path); free(dit_path); free(vae_path);
     free(audio_vae_path);
+    free(vae_config_path);
     h3_tokenizer_free(tokenizer);
     h3_tokenizer_ids_free(ids);
     for (size_t image = 0; image < visual_capacity; image++) {

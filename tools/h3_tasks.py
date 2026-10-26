@@ -40,7 +40,8 @@ NORMALIZATION_POLICIES = {
         'transformations': ['cover_crop', 'reference_resize', 'time_resample', 'audio_resample', 'audio_right_pad'],
         'excludes': ['overrun_trim', 'clip_floor', 'frame_floor', 'short_clip_to_image',
                      'source_selection', 'condition_drop', 'speech_rewrite', 'internal_downrender',
-                     'reference_trim', 'reference_frame_floor', 'reference_audio_trim', 'reference_first_frame']}}
+                     'reference_trim', 'reference_frame_floor', 'reference_audio_trim', 'reference_first_frame',
+                     'guide_first_frame']}}
 
 
 class TaskError(Exception):
@@ -207,10 +208,10 @@ def reference_canvas(asset, params, kind):
     """Mirror the released h3_host reference-sizing equations, not guide crop."""
     width, height = asset['width'], asset['height']
     if kind == 'image':
-        size_policy = params.get('reference_image_size', 0)
-        if size_policy not in (0, 1):
+        size_policy = params.get('reference_image_size', 'match')
+        if size_policy not in ('match', 'max'):
             fail('profile_incompatible', 'task.profile', 'Unknown native reference image sizing policy.')
-        scale = (min(1, 2048 / min(width, height)) if size_policy == 1 else
+        scale = (min(1, 2048 / min(width, height)) if size_policy == 'max' else
                  min(1, math.sqrt(params['width'] * params['height'] / (width * height))))
         return [max(32, round(width * scale / 32) * 32), max(32, round(height * scale / 32) * 32)]
     ratio = width / height
@@ -303,6 +304,25 @@ CREATE TABLE IF NOT EXISTS fingerprints(path TEXT PRIMARY KEY, signature TEXT NO
         except (OSError, ValueError, subprocess.TimeoutExpired) as e:
             fail('engine_failed', 'config.engine', 'Native capability probe failed.', reason=str(e))
 
+    def _transition_count(self, params):
+        steps = params.get('steps', 0)
+        scheduler = params.get('scheduler', 'serving')
+        if scheduler not in ('beta', 'beta57'):
+            return steps
+        args = [self.config['engine'], '--schedule-json', scheduler, str(steps),
+                str(params.get('video_shift', 12)), str(params.get('audio_shift', 3))]
+        try:
+            result = subprocess.run(args, capture_output=True, text=True, timeout=20,
+                                    env=self.native_environment())
+            value = json.loads(result.stdout)
+            if (result.returncode or value.get('schema_version') != 1 or
+                    value.get('requested_steps') != steps or
+                    type(value.get('transitions')) is not int or not 0 < value['transitions'] <= steps):
+                raise ValueError('Invalid native schedule response')
+            return value['transitions']
+        except (OSError, ValueError, AttributeError, subprocess.TimeoutExpired) as error:
+            fail('engine_failed', 'task.start_transition', 'Native schedule query failed.', reason=str(error))
+
     def profiles(self):
         result = []
         for name, source in sorted(self.config.get('profiles', {}).items()):
@@ -316,17 +336,23 @@ CREATE TABLE IF NOT EXISTS fingerprints(path TEXT PRIMARY KEY, signature TEXT NO
                 fail('profile_incompatible', 'config.profiles.' + name + '.execution_mode', 'Unknown execution mode.')
             profile['reference_sizing'] = {'version': 1, 'image': 'native match/max area then nearest32 stretch',
                                            'video': 'native768_short_edge_max1032192_pixels_no_upscale_nearest32_stretch'}
-            missing = []
-            for dep in profile.get('dependencies', []):
-                if not Path(dep['path']).is_file():
-                    missing.append(dep)
-                elif not dep.get('sha256') or self.sha(dep['path']) != dep['sha256']:
-                    missing.append(dict(dep, reason='digest_mismatch'))
-            if not profile.get('dependencies'):
-                missing.append({'role': 'explicit_model_inventory', 'reason': 'not_configured'})
-            result.append(dict(profile, id=name, availability='missing_model' if missing else 'available',
-                               missing=missing, profile_digest=digest(profile)))
+            result.append(self._refresh_profile(profile, name))
         return result
+
+    def _refresh_profile(self, profile, name):
+        profile = json.loads(canonical(profile))
+        for key in ('id', 'availability', 'missing', 'profile_digest'):
+            profile.pop(key, None)
+        missing = []
+        for dep in profile.get('dependencies', []):
+            if not Path(dep['path']).is_file():
+                missing.append(dep)
+            elif not dep.get('sha256') or self.sha(dep['path']) != dep['sha256']:
+                missing.append(dict(dep, reason='digest_mismatch'))
+        if not profile.get('dependencies'):
+            missing.append({'role': 'explicit_model_inventory', 'reason': 'not_configured'})
+        return dict(profile, id=name, availability='missing_model' if missing else 'available',
+                    missing=missing, profile_digest=digest(profile))
 
     def capabilities(self, request):
         return dict(schema_version=1, native=self.native(), profiles=self.profiles(),
@@ -609,17 +635,21 @@ CREATE TABLE IF NOT EXISTS fingerprints(path TEXT PRIMARY KEY, signature TEXT NO
         if not isinstance(cap, dict) or cap.get('availability') != 'available':
             fail('profile_incompatible', field, 'Native capability is unavailable.', capability=name, reported=cap)
 
-    def prepare(self, request):
+    def prepare(self, request, *, _context=None):
         task = json.loads(canonical(request.get('task', {})))
         allowed = {'profile', 'prompt', 'frames', 'references', 'guides', 'outputs', 'normalization',
-                   'initial_latent', 'mask', 'start_transition', 'operation', 'parent', 'assembly', 'intent', 'execution_mode'}
+                   'initial_latent', 'mask', 'start_transition', 'operation', 'parent', 'intent', 'execution_mode'}
         for key in task:
             if key not in allowed:
                 fail('invalid_request', 'task.' + key, 'Unknown task field.')
         if task.get('operation', 'generate') != 'generate':
             fail('invalid_request', 'task.operation', 'Use the dedicated resume operation for checkpoints.')
-        profiles = {p['id']: p for p in self.profiles()}
-        profile = profiles.get(task.get('profile'))
+        context = _context or {}
+        if context.get('profile') is not None:
+            profile = self._refresh_profile(context['profile'], task.get('profile'))
+        else:
+            profiles = {p['id']: p for p in self.profiles()}
+            profile = profiles.get(task.get('profile'))
         if not profile:
             fail('profile_incompatible', 'task.profile', 'Unknown explicit profile.')
         if not isinstance(task.get('prompt', ''), str):
@@ -632,16 +662,17 @@ CREATE TABLE IF NOT EXISTS fingerprints(path TEXT PRIMARY KEY, signature TEXT NO
                 any(type(v) is not bool for v in outputs.values()) or not any(outputs.values())):
             fail('invalid_request', 'task.outputs', 'Select media and/or latent boolean outputs.')
         task['outputs'] = outputs
-        for key in ('references', 'guides'):
-            if not isinstance(task.get(key, []), list) or len(task.get(key, [])) > 64:
-                fail('invalid_request', 'task.' + key, 'Expected an ordered list of at most 64 entries.')
+        for key, limit in (('references', 12), ('guides', 64)):
+            if not isinstance(task.get(key, []), list) or len(task.get(key, [])) > limit:
+                fail('invalid_request', 'task.' + key, f'Expected an ordered list of at most {limit} entries.')
         frames = integer(task.get('frames', 124), 'task.frames', 5)
         transforms = []
         approval = task.get('normalization', profile['normalization_policy'])
         if isinstance(approval, str):
             if approval not in NORMALIZATION_POLICIES:
                 fail('invalid_request', 'task.normalization', 'Unknown normalization policy.')
-            policy = NORMALIZATION_POLICIES[approval]
+            policy = (profile['normalization_policy_definition'] if approval == profile['normalization_policy']
+                      else NORMALIZATION_POLICIES[approval])
             approved = policy['transformations']
         elif isinstance(approval, list) and all(isinstance(x, str) for x in approval):
             approved = approval
@@ -661,6 +692,9 @@ CREATE TABLE IF NOT EXISTS fingerprints(path TEXT PRIMARY KEY, signature TEXT NO
             fail('profile_incompatible', 'task.frames', 'Duration exceeds the validated profile range.')
         defaults = {'denoise_reuse': 1, 'core_reuse': 1, 'dit_layers': 50, 'token_reduction': 0, 'ssd_streaming': 0}
         params = dict(defaults, **profile.get('params', {}))
+        params.setdefault('reference_image_size', 'match')
+        if params['reference_image_size'] not in ('match', 'max'):
+            fail('profile_incompatible', 'task.profile', 'Reference image sizing must be match or max.')
         params['frames'] = frames
         runtime_paths = {'initial_latent_path', 'mask_path', 'resume_path', 'checkpoint_path', 'output_path', 'latent_output_path', 'input_path'}
         if set(params) & runtime_paths:
@@ -687,6 +721,7 @@ CREATE TABLE IF NOT EXISTS fingerprints(path TEXT PRIMARY KEY, signature TEXT NO
         reference_preprocessing, guide_spans = [], []
         total_reference_audio_samples = 0
         references, guides, assets, occupied = [], [], {}, []
+        reference_counts = dict(image=0, video=0, audio=0)
         for i, ref in enumerate(task.get('references', [])):
             field = f'task.references[{i}]'
             if set(ref) - {'asset_id', 'role', 'include_embedded_audio', 'audio_asset_id'}:
@@ -749,6 +784,11 @@ CREATE TABLE IF NOT EXISTS fingerprints(path TEXT PRIMARY KEY, signature TEXT NO
                     prepared_reference['video_frames'] = cadence
                     prepared_reference['video_selection'] = {'start_frame': 0, 'frames': cadence, 'fps': 24}
             audio_bearing = role in ('audio', 'video_audio') or ref.get('include_embedded_audio', False)
+            reference_counts['image'] += role == 'image'
+            reference_counts['video'] += role in ('video', 'video_audio')
+            reference_counts['audio'] += bool(audio_bearing)
+            if any(reference_counts[k] > limit for k, limit in (('image', 9), ('video', 3), ('audio', 3))):
+                fail('invalid_request', 'task.references', 'Native reference limits are nine images, three videos and three audio inputs.', counts=reference_counts)
             if audio_bearing:
                 audio_asset = replacement or a
                 audio_field = field + '.audio_asset_id' if replacement else field
@@ -775,8 +815,8 @@ CREATE TABLE IF NOT EXISTS fingerprints(path TEXT PRIMARY KEY, signature TEXT NO
                 prepared_reference['audio'] = {'asset_id': audio_asset['asset_id'], 'samples_32k': samples,
                                                 'padded_samples_32k': padded_samples, 'channels': 2}
             reference_preprocessing.append(prepared_reference)
-        if profile.get('target') not in ('fl2va', 'ref2va') or (references and profile.get('target') != 'ref2va'):
-            fail('profile_incompatible', 'task.profile', 'References require an explicit Ref2VA target; target selection is never silently changed.')
+        if profile.get('target') not in ('fl2va', 'ref2va'):
+            fail('profile_incompatible', 'task.profile', 'Select an explicit FL2VA or Ref2VA target.')
         for i, guide in enumerate(task.get('guides', [])):
             field = f'task.guides[{i}]'
             if set(guide) - {'asset_id', 'kind', 'frame', 'source_start_frame', 'source_frames', 'audio_asset_id'}:
@@ -802,6 +842,9 @@ CREATE TABLE IF NOT EXISTS fingerprints(path TEXT PRIMARY KEY, signature TEXT NO
                 image_frames = integer(guide.get('source_frames', 1), field + '.source_frames', 1)
                 if image_frames != 1:
                     fail('invalid_request', field + '.source_frames', 'Image guides require exactly one source frame.')
+                if a.get('frames', 0) > 1:
+                    transform('guide_first_frame', field, {'source_frames': a['frames']},
+                              {'source_start_frame': 0, 'source_frames': 1})
             length = 1
             streams = ['audio'] if kind == 'audio' else ['video', 'audio'] if kind == 'clip_audio' else ['video']
             audio_asset = a
@@ -873,6 +916,7 @@ CREATE TABLE IF NOT EXISTS fingerprints(path TEXT PRIMARY KEY, signature TEXT NO
             assets[a['asset_id']] = a
             guide_spans.append({'asset_id': a['asset_id'], 'source_start_frame': source_start,
                                 'source_frames': length, 'source_frame_clock': 24, 'target_frame': start,
+                                'asset_source_frames': a.get('frames') if kind == 'image' else a.get('frames_24'),
                                 'target_stream_spans': spans})
         encode_source = None
         for key, native_key, capability in [('initial_latent', 'initial_latent_path', 'initial_latent'),
@@ -913,11 +957,15 @@ CREATE TABLE IF NOT EXISTS fingerprints(path TEXT PRIMARY KEY, signature TEXT NO
                         fail('latent_incompatible', 'task.mask', 'Masks require finite values in [0,1]; 0 preserves, 1 edits.')
                 params[native_key] = a['path']
                 assets[a['asset_id']] = a
+        transitions = self._transition_count(params) if controlled_edit else params.get('steps', 0)
         if 'start_transition' in task:
             start = integer(task['start_transition'], 'task.start_transition')
-            if start > params.get('steps', 0) or 'initial_latent' not in task:
+            if start > transitions or 'initial_latent' not in task:
                 fail('invalid_request', 'task.start_transition', 'Partial denoise requires clean latents and a valid transition.')
             params['start_transition'] = start
+        terminal_decode = 'initial_latent_path' in params and params.get('start_transition', 0) == transitions
+        if not terminal_decode and bool(references) != (profile.get('target') == 'ref2va'):
+            fail('profile_incompatible', 'task.profile', 'Nonterminal Ref2VA requires references; FL2VA requires no references. Target selection is never silently changed.')
         manifest = dict(schema_version=1, operation=task.get('operation', 'generate'),
                         model_dir=profile.get('model_dir'), target=profile.get('target'),
                         prompt=resolved_prompt, params=params, references=references, guides=guides)
@@ -927,9 +975,10 @@ CREATE TABLE IF NOT EXISTS fingerprints(path TEXT PRIMARY KEY, signature TEXT NO
             if any(lora['path'] not in pinned_paths for lora in profile['loras']):
                 fail('profile_incompatible', 'task.profile', 'Every adapter requires a pinned dependency digest.')
         resolved = dict(manifest=manifest, profile=profile, assets=list(assets.values()),
-                        native=native, assembly=task.get('assembly'),
+                        native=native, assembly=context.get('assembly'),
                         execution_digest=digest({'manifest': manifest, 'mode': mode, 'profile': profile,
                                                  'assets': list(assets.values()), 'native': native,
+                                                 'assembly': context.get('assembly'),
                                                  'policy': policy, 'transformations': transforms}),
                         encode_source=encode_source, normalization_policy=policy,
                         reference_preprocessing=reference_preprocessing, guide_spans=guide_spans,
@@ -1077,6 +1126,8 @@ CREATE TABLE IF NOT EXISTS fingerprints(path TEXT PRIMARY KEY, signature TEXT NO
         if source.get('fps') != 24:
             fail('normalization_required', 'asset_id', 'Continuation source must be explicitly registered at 24 fps.')
         task = dict(request.get('task', {}))
+        if 'assembly' in task:
+            fail('invalid_request', 'task.assembly', 'Assembly is owned by continuation, not caller task fields.')
         profile = self.config.get('profiles', {}).get(task.get('profile'), {})
         if join == 'concatenated' and (source.get('width'), source.get('height')) != (profile.get('params', {}).get('width'), profile.get('params', {}).get('height')):
             fail('profile_incompatible', 'task.profile', 'Concatenation requires the profile canvas to match the retained source prefix.')
@@ -1084,20 +1135,21 @@ CREATE TABLE IF NOT EXISTS fingerprints(path TEXT PRIMARY KEY, signature TEXT NO
             fail('invalid_request', 'task', 'Continuation owns tail guides and target length.')
         task.update(frames=tail + additional, parent=parent['job_id'] if parent else source['asset_id'],
                     guides=[dict(asset_id=source['asset_id'], kind='clip_audio' if mode == 'condition' else 'clip',
-                                 frame=0, source_start_frame=source['frames'] - tail, source_frames=tail)],
-                    assembly=dict(source_asset=source['asset_id'], source_frames=source['frames'],
+                                 frame=0, source_start_frame=source['frames'] - tail, source_frames=tail)])
+        assembly = dict(source_asset=source['asset_id'], source_frames=source['frames'],
                                   overlap_frames=tail, added_frames=additional, join_mode=join, audio_mode=mode,
                                   video_codec='libx264', audio_codec='aac' if mode != 'discard' else None,
                                   audio_rate=32000, audio_channels=2,
                                   audio_padding='right-pad to declared segment duration; silence where no source audio exists',
                                   final_frames=source['frames'] + additional if join == 'concatenated' else tail + additional,
                                   join_timestamp=source['frames'] / 24,
-                                  policy='explicit_reencode_no_crossfade', discarded_generated_overlap=tail if join == 'concatenated' else 0))
+                                  policy='explicit_reencode_no_crossfade', discarded_generated_overlap=tail if join == 'concatenated' else 0)
         if request.get('assembly_policy') != 'explicit_reencode_no_crossfade':
             fail('normalization_required', 'assembly_policy', 'Explicit re-encoding assembly approval is required.')
-        return self.prepare({'task': task})
+        return self.prepare({'task': task}, _context={'assembly': assembly})
 
     def revise(self, request):
+        profile_snapshot = None
         if request.get('asset_id'):
             if request.get('job_id'):
                 fail('invalid_request', 'asset_id', 'Choose one revision source.')
@@ -1106,13 +1158,19 @@ CREATE TABLE IF NOT EXISTS fingerprints(path TEXT PRIMARY KEY, signature TEXT NO
             baseline = request.get('task')
             if not isinstance(baseline, dict) or 'profile' not in baseline or 'frames' not in baseline:
                 fail('invalid_request', 'task', 'Registered-asset revision requires explicit profile and target frames.')
+            if 'assembly' in baseline:
+                fail('invalid_request', 'task.assembly', 'Assembly is owned by continuation, not caller task fields.')
         else:
             job = self.get('jobs', request.get('job_id'), 'job_id')
             old = self.get('plans', job['plan_id'], 'job_id')
-            latent = job.get('outputs', {}).get('latent') or job.get('outputs', {}).get('media')
+            concatenated = (old['resolved'].get('assembly') or {}).get('join_mode') == 'concatenated'
+            outputs = job.get('outputs', {})
+            latent = ((outputs.get('media') or outputs.get('latent')) if concatenated else
+                      outputs.get('latent') or outputs.get('media'))
             if not latent:
                 fail('latent_incompatible', 'job_id', 'Revision requires published clean latents or media to encode.')
             baseline, parent = old['intent'], job['job_id']
+            profile_snapshot = old['resolved']['profile']
             source = self.asset(latent, 'job_id')
         patch = request.get('patch', {})
         if set(patch) - {'prompt', 'intent', 'references', 'guides', 'mask', 'start_transition', 'normalization', 'execution_mode'}:
@@ -1121,7 +1179,7 @@ CREATE TABLE IF NOT EXISTS fingerprints(path TEXT PRIMARY KEY, signature TEXT NO
         if source['kind'] == 'media':
             task['frames'] = source['frames']
             source_canvas = [source['width'], source['height']]
-            profile_params = self.config.get('profiles', {}).get(task.get('profile'), {}).get('params', {})
+            profile_params = (profile_snapshot or self.config.get('profiles', {}).get(task.get('profile'), {})).get('params', {})
             if source_canvas != [profile_params.get('width'), profile_params.get('height')]:
                 fail('profile_incompatible', 'task.profile', 'Revision profile canvas must match the selected published media.', source_canvas=source_canvas)
         task['execution_mode'] = patch.get('execution_mode', 'resumable')
@@ -1133,7 +1191,7 @@ CREATE TABLE IF NOT EXISTS fingerprints(path TEXT PRIMARY KEY, signature TEXT NO
             task.pop(key, None)
         task.update(patch, operation='generate', initial_latent=latent, parent=parent)
         task.setdefault('start_transition', 0)
-        return self.prepare({'task': task})
+        return self.prepare({'task': task}, _context={'profile': profile_snapshot})
 
     def resume(self, request):
         if set(request) - {'operation', 'job_id'}:

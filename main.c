@@ -25,6 +25,8 @@ static void usage(const char *program) {
         "  -d, --model-dir PATH   MiniMax-H3 local directory\n"
         "      --manifest PATH     Execute strict version-1 JSON manifest (standalone)\n"
         "      --capabilities-json  Probe native interfaces without loading models\n"
+        "      --schedule-json SCHEDULER STEPS VIDEO_SHIFT AUDIO_SHIFT\n"
+        "                          Resolve native sigma schedule without loading models\n"
         "  -p, --prompt TEXT      Raw H3 prompt\n"
         "  -o, --output PATH      Output MP4 (default: outputs/h3.mp4)\n"
         "      --width N          Output width (default: 864)\n"
@@ -261,6 +263,8 @@ int main(int argc, char **argv) {
         return h3_cli_capabilities();
     if (argc == 3 && !strcmp(argv[1], "--manifest"))
         return h3_cli_manifest(argv[2]);
+    if (argc == 6 && !strcmp(argv[1], "--schedule-json"))
+        return h3_cli_schedule(argv[2], argv[3], argv[4], argv[5]);
     if (atexit(free_cli_loras) != 0) return 1;
     size_t lora_count = 0, lora_capacity = 0;
     enum { OPT_WIDTH = 1000, OPT_HEIGHT, OPT_RENDER_WIDTH, OPT_RENDER_HEIGHT,
@@ -380,11 +384,17 @@ int main(int argc, char **argv) {
                 if(guide_count>=128 || optind>=argc) { fprintf(stderr,"h3: guide requires FRAME PATH (maximum 128 guides)\n");return 2; }
                 guides[guide_count++]=(h3_guide){.kind=(h3_guide_kind)(option-OPT_GUIDE_IMAGE),.frame_index=parse_int(optarg,"guide frame"),.path=argv[optind++],.include_embedded_audio=option==OPT_GUIDE_CLIP_AUDIO};
                 break;
-            case OPT_GUIDE_SOURCE_START: case OPT_GUIDE_SOURCE_FRAMES: case OPT_GUIDE_AUDIO_PATH:
+            case OPT_GUIDE_SOURCE_START: case OPT_GUIDE_SOURCE_FRAMES:
                 if(!guide_count) {fprintf(stderr,"h3: guide modifier requires a preceding guide\n");return 2;}
                 if(option==OPT_GUIDE_SOURCE_START) guides[guide_count-1].source_start_frame=parse_int(optarg,"guide source start");
-                else if(option==OPT_GUIDE_SOURCE_FRAMES) guides[guide_count-1].source_frames=parse_int(optarg,"guide source frames");
-                else {guides[guide_count-1].audio_path=optarg;guides[guide_count-1].include_embedded_audio=0;}
+                else guides[guide_count-1].source_frames=parse_int(optarg,"guide source frames");
+                break;
+            case OPT_GUIDE_AUDIO_PATH:
+                if(!guide_count) {fprintf(stderr,"h3: guide modifier requires a preceding guide\n");return 2;}
+                if(guides[guide_count-1].kind!=H3_GUIDE_CLIP && guides[guide_count-1].kind!=H3_GUIDE_CLIP_AUDIO) {fprintf(stderr,"h3: --guide-audio-path requires a preceding clip guide\n");return 2;}
+                guides[guide_count-1].kind=H3_GUIDE_CLIP_AUDIO;
+                guides[guide_count-1].audio_path=optarg;
+                guides[guide_count-1].include_embedded_audio=0;
                 break;
             case OPT_VIDEO_SHIFT: params.video_shift = parse_shift(optarg); break;
             case OPT_AUDIO_SHIFT: params.audio_shift = parse_shift(optarg); break;
@@ -634,9 +644,6 @@ int main(int argc, char **argv) {
     if (ctx->loras) h3_lora_stack_report(ctx->loras, stderr);
     if (info) print_info(ctx);
     if (prompt) {
-        if(params.first_frame) guides[params.guide_count++]=(h3_guide){.kind=H3_GUIDE_IMAGE,.path=params.first_frame,.frame_index=0};
-        if(params.last_frame) guides[params.guide_count++]=(h3_guide){.kind=H3_GUIDE_IMAGE,.path=params.last_frame,.frame_index=params.frames-1};
-        params.first_frame=params.last_frame=NULL;
         params.output_path = output;
         params.on_progress = cli_progress;
         params.callback_opaque = &cli;

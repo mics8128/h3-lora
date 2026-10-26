@@ -3,6 +3,7 @@
 #include "h3_metal.h"
 #include "h3_safetensors.h"
 #include "h3_terminal.h"
+#include "h3_sampler.h"
 
 #include <math.h>
 #include <stdint.h>
@@ -270,6 +271,13 @@ static void test_layout_mixed_guides(void) {
     CHECK(!h3_layout_build(&spec,&l,error,sizeof(error)));
     guides[1].frame_index=10; guides[1].audio_t=40;
     CHECK(!h3_layout_build(&spec,&l,error,sizeof(error)));
+    h3_layout_guide adjacent[]={{0,73,19,2,2,0,0,0,1},{64,1,1,2,2,0,19,0,2}};
+    h3_layout_spec adjacent_spec={1,27,2,2,150,90,adjacent,2,NULL,0};
+    CHECK(h3_layout_build(&adjacent_spec,&l,error,sizeof(error)));
+    h3_layout_free(&l);
+    adjacent[1].frame_index=63;
+    CHECK(!h3_layout_build(&adjacent_spec,&l,error,sizeof(error)));
+    CHECK(strstr(error,"guide_overlap")!=NULL);
 }
 
 static void test_layout_guide_error_identity(void) {
@@ -365,6 +373,44 @@ static void inventory_fixture_file(const char *root, const char *relative,
     CHECK(fclose(file) == 0);
 }
 
+static int count_preflight_progress(const char *phase, int done, int total, void *opaque) {
+    (void)phase; (void)done; (void)total;
+    (*(int *)opaque)++;
+    return 1;
+}
+
+static void check_resume_preflight(h3_ctx *ctx, const char *root) {
+    char path[512]; snprintf(path,sizeof(path),"%s/resume.bin",root);
+    h3_params p=H3_PARAMS_DEFAULT;
+    p.width=32; p.height=32; p.frames=22;
+    p.resume_path=path;
+    int progress=0;
+    p.on_progress=count_preflight_progress; p.callback_opaque=&progress;
+    CHECK(h3_resume(ctx,"preflight",&p)==NULL);
+    CHECK(!strcmp(h3_last_error_code(ctx),"checkpoint_incompatible"));
+    CHECK(progress==0);
+    FILE *f=fopen(path,"wb"); CHECK(f!=NULL);
+    CHECK(fputs("truncated",f)>=0); CHECK(fclose(f)==0);
+    CHECK(h3_resume(ctx,"preflight",&p)==NULL);
+    CHECK(!strcmp(h3_last_error_code(ctx),"checkpoint_incompatible"));
+    CHECK(progress==0);
+    h3_sampler_config c={0}; c.kind=p.sampler;
+    CHECK(h3_serving_schedule_build(p.steps,p.video_shift,p.audio_shift,&c.schedule));
+    c.video_shift=p.video_shift; c.audio_shift=p.audio_shift; c.seed=p.seed+1;
+    int w,h; h3_latent_canvas(p.width,p.height,&w,&h);
+    h3_temporal_shape t=h3_temporal(p.frames);
+    c.video_count=(size_t)24*t.video_t*w*h; c.audio_count=(size_t)64*t.audio_t;
+    float *v=calloc(c.video_count,sizeof(float)),*a=calloc(c.audio_count,sizeof(float));
+    CHECK(v && a); char error[256];
+    h3_sampler_state *s=h3_sampler_state_start(&c,v,a,NULL,NULL,NULL,NULL,error,sizeof(error));
+    CHECK(s!=NULL); CHECK(h3_sampler_state_save(s,path,error,sizeof(error)));
+    h3_sampler_state_free(s); free(v); free(a);
+    CHECK(h3_resume(ctx,"preflight",&p)==NULL);
+    CHECK(!strcmp(h3_last_error_code(ctx),"checkpoint_incompatible"));
+    CHECK(progress==0);
+    CHECK(unlink(path)==0);
+}
+
 static void test_optional_reference_inventory(void) {
     char root[] = "/tmp/h3_inventory_XXXXXX", path[512];
     CHECK(mkdtemp(root) != NULL);
@@ -372,15 +418,17 @@ static void test_optional_reference_inventory(void) {
         "FL2VA/text_encoder", "FL2VA/video_vae", "FL2VA/video_vae/source", "FL2VA/audio_vae"};
     const char *files[] = {"FL2VA/transformer/config.json", "FL2VA/tokenizer/tokenizer.json",
         "FL2VA/transformer/model.safetensors", "FL2VA/text_encoder/model.safetensors",
-        "FL2VA/video_vae/source/model.safetensors", "FL2VA/audio_vae/model.safetensors"};
+        "FL2VA/video_vae/source/model.safetensors", "FL2VA/audio_vae/model.safetensors",
+        "FL2VA/video_vae/config.json"};
     for (size_t i = 0; i < sizeof(directories) / sizeof(*directories); i++) {
         snprintf(path, sizeof(path), "%s/%s", root, directories[i]);
         CHECK(mkdir(path, 0700) == 0);
     }
     for (size_t i = 0; i < sizeof(files) / sizeof(*files); i++)
-        inventory_fixture_file(root, files[i], i >= 2);
+        inventory_fixture_file(root, files[i], i >= 2 && i < 6);
     h3_ctx *ctx = h3_load_dir(root, NULL, 0, H3_LORA_FL2VA);
     CHECK(ctx && h3_model(ctx)->ref2va_transformer.files == 0);
+    check_resume_preflight(ctx,root);
     h3_free(ctx);
     snprintf(path, sizeof(path), "%s/Ref2VA", root);
     CHECK(mkdir(path, 0700) == 0);
