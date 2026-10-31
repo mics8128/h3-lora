@@ -98,7 +98,7 @@ are recorded in [COMFY_CACHE_RESEARCH.md](COMFY_CACHE_RESEARCH.md).
 |---|---|---|
 | [75: lazy direct Metal pipelines](https://github.com/antirez/h3.c/pull/75), `30b63b51404cae1f2dcc1841abea96f1893c5b49` | Library compilation remains eager; named direct pipelines now build on first use and cache successes per GPU context. All custom direct encoders use the central getter; MPSGraph caches remain separate. | Implemented without arithmetic changes. Paired F32 CLI outputs match complete baseline RGB/PCM hashes. Eager median136.023s vs final lazy136.140s is a noise-scale difference, not confirmation of the author's14% claim. |
 | [73: VAE low precision/cache/prefetch](https://github.com/antirez/h3.c/pull/73), `aac7b5ab1b920ede22c7ce55e6139d11bde06173` | F32 remains default; `H3_VAE_PRECISION=bf16` selects BF16 large projections/SDPA with F32 residual/norm/RoPE/SwiGLU/small projections. | BF16-only implemented; invalid values fail and resident decoder identity includes precision. No int8, disk cache or prefetch. Final39f/768p VAE median40.868→13.909s; complete wall136.140→110.814s (18.60% less). These are our workload, not the author's768x448/124f replay. |
-| [78: stable tile band](https://github.com/antirez/h3.c/pull/78), `c1459cc89c91fe74d2c9a036bc3e1efbae1c5339` | Auto candidates become 256/272/288/304 instead of also considering320. Author reports about34% less temporal flicker for304 vs320, but **+8% modeled decode cost** and a73f/50step example52→55min. | Quality investigation, not a speedup. Do not change tile and precision simultaneously; local auto maximum remains320. |
+| [78: stable tile band](https://github.com/antirez/h3.c/pull/78), `c1459cc89c91fe74d2c9a036bc3e1efbae1c5339` | Auto candidates become 256/272/288/304 instead of also considering320. Author reports about34% less temporal flicker for304 vs320, but **+8% modeled decode cost** and a73f/50step example52→55min. | Local default now matches the released256px geometry. One768x768/107f same-latent comparison against official PyTorch measured30.54dB at288px and38.32dB at256px after CRF18 encoding; not raw-tensor parity. Larger tiles alter attention context and normalised RoPE positions. |
 | [68: retain VAE across input changes](https://github.com/antirez/h3.c/pull/68), `38ccf9b2e17108c09f8b7dd75dc2327a3a3605e4` | Its objective is already covered by local resident/request separation and removal of reference-change eager clears. Local code additionally retains compatible DiT weights. | Do not copy its unconditional DiT invalidation on input changes; it would lose current reuse. |
 | [63: causal-GQA scratch barrier](https://github.com/antirez/h3.c/pull/63), `1b5afccec7524c8806597d0837a9aa125995e90b` | Same max→sum scratch reuse barrier is now present locally, independently exercised by the multi-SIMD numerical oracle. Local visual-encoder GroupNorm also has the corresponding mean→variance barrier. | Correctness fix already covered, not a new speed claim. Keep synchronization. |
 | [55: int8 weight-cache streaming](https://github.com/antirez/h3.c/pull/55), `8b51e19b9b88ce09e670039aebf8b7e98697e785` | Disk cache contains prequantized QKV/out/MLP weights, not attention results. Fingerprint does not bind dynamic LoRA order/strength/composition; a model fingerprint mismatch only warns. | Not a default128GB resident-speed strategy. Adapted weights must never be bypassed by a base-only cache. |
@@ -158,8 +158,9 @@ The reported34% is a specific high-pass temporal-flicker metric comparison,
 not a guarantee that latent noise or static checkerboards disappear.
 [Pinned tile implementation](https://github.com/bluetorch/h3.c/blob/c1459cc89c91fe74d2c9a036bc3e1efbae1c5339/h3_video_vae.c#L666-L701).
 
-**Implementation boundary:** lazy direct pipelines and BF16-only VAE are now
-implemented; F32 remains default. Tile-band changes remain a separate quality
-proposal. Existing CLI use is preserved: no cache builders, daemon state,
-low-memory streaming or simultaneous tile/default-precision changes. See
+**2026-10-24 integration boundary:** lazy direct pipelines and BF16-only VAE
+were implemented independently of PR78's tile-band proposal; F32 remains the
+precision default. The later fixed256 geometry correction is documented in
+`EROS_BETA7_SETUP.md`. No cache builders, daemon state or low-memory streaming
+were added by this integration. See
 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for source attribution.

@@ -714,10 +714,14 @@ aggressive point. The latter produced a coherent walking fox and repeated at
 8.02 seconds of DiT versus about 15.82 seconds natively. Native 256 uses the
 same-cost spatial-RoPE adaptation described above; it remains a fast composition
 preview rather than a substitute for a 512- or 768-class final render.
-The video VAE automatically chooses a 256-320 pixel spatial tile from the
-requested canvas geometry, minimizing repeated overlap work while keeping peak
-storage bounded. `H3_VAE_TILE_PIXELS=256` restores the original conservative
-tile plan for close-reference diagnosis. Tiles blend in Comfy `tiled_decode`
+The video VAE decodes in 256 pixel spatial tiles, the released config and Comfy
+default. Tile size changes both attention context and normalised RoPE positions.
+On one 768x768/107-frame latent, native 288px decoding measured 30.54 dB
+against the official PyTorch decoder; native 256px measured 38.32 dB (both
+outputs encoded with H.264 CRF18). Face crops were closer at 256px; this is
+not a raw-tensor parity test or proof that every reported line is resolved.
+`H3_VAE_TILE_PIXELS` (256-512, multiple of 16) remains an
+experiment-only override. Tiles blend in Comfy `tiled_decode`
 order (above row as composited, then the blended left tile) on unclamped
 pixels; clamping to [0,1] happens once after spatial and temporal blending.
 

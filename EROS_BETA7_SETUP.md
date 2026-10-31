@@ -65,11 +65,21 @@ video-maker 改用 beta7：profile 的 `engine` 指向 beta7 runtime、`ref2va_m
 - **RoPE、位置、QKV／SwiGLU 順序**：都相符。
 - **DiT 內 BF16 中間捨入**：與 Comfy eager 有差異，原生在 F32 做融合運算，不是公式錯誤。
 
-唯一確認的錯誤在 VAE 拼接：tile 交叉點原本與未混合的鄰塊混合，而且在混合前就先 clamp，已依 Comfy 修正，合成結果誤差 ≤3.6e-7。這只影響 tile 交叉點和超出範圍的像素，時間閃爍指標不變。
+這輪查證確認 VAE 拼接錯誤：tile 交叉點原本與未混合的鄰塊混合，而且在混合前就先 clamp，已依 Comfy 修正，合成結果誤差 ≤3.6e-7。時間閃爍指標不變，未解決使用者後續回報的人臉直線。
 
-beta7 前約 20 幀的高變化量，在 latent 階段就已存在：前 5 個轉換的 RMS 為 0.589，同設定 beta5 為 0.475。這屬於模型行為，作者建議以 2-pass upscaler 處理。
+beta7 前約 20 幀的高變化量，在 latent 階段就已存在：前 5 個轉換的 RMS 為 0.589，同設定 beta5 為 0.475。這表示差異不只出在最終 VAE 解碼；尚不能單憑此數據排除生成實作差異。
 
 **未對齊**：
 - mask 生成的逐 token 時間步（Comfy #15375）。
 - ER-SDE 初始音訊 packing 約 2e-5 的偏差。
 - σ=0 端點的時間步差異，約 2e-6。
+
+## VAE 解碼幾何對照（2026-11-01）
+
+同一個 768²／107 幀 latent，分別以原生及隨模型提供的官方 PyTorch VAE 解碼。官方設定使用 256px tile，原生舊 auto 選 288px；tile 大小同時改變 attention 上下文和正規化 RoPE 位置，不是無損效能參數。
+
+- 以同樣 H.264 CRF18 編碼後，原生 288px 相對官方 PSNR 為 30.54dB，256px 為 38.32dB；第26、30幀的人臉 crop 在256px較接近官方。
+- 官方 raw 相對自身 CRF18 為36.94dB；上述數值不能當作 raw tensor parity 或已到編碼誤差下限的證明。
+- 預設已固定256px。無環境覆寫的實跑輸出，RGB逐位元組等於先前明確設定 `H3_VAE_TILE_PIXELS=256` 的影片。
+- `H3_VAE_TILE_PIXELS` 保留為實驗覆寫；512px曾產生明顯格紋和偏色，不建議使用。
+- 這是單一latent的解碼對照，並非完整ComfyUI生成或所有直線症狀已消失的驗收。
