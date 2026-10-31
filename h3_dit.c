@@ -2973,12 +2973,9 @@ int h3_dit_denoise_simple_preview(h3_dit *dit, h3_sampler_kind kind,
         audio_latent, h3_dit_audio_elements(dit), simple_evaluate, &adapter,
         NULL, NULL, simple_observe, &adapter, error, error_size);
     if (getenv("H3_PROFILE")) {
-        const char *name = kind == H3_SAMPLER_EULER ? "euler" :
-                           kind == H3_SAMPLER_LCM ? "lcm" :
-                           kind == H3_SAMPLER_ER_SDE ? "er_sde" : "res_multistep";
         fprintf(stderr, "h3 sampler: {\"kind\":\"%s\",\"scheduler\":\"explicit\","
                         "\"nfe\":%d,\"success\":%d,\"video_sigmas\":[",
-                name, adapter.evaluations, ok);
+                h3_sampler_name(kind), adapter.evaluations, ok);
         for (int i = 0; i <= dit->sigmas.steps; i++)
             fprintf(stderr, "%s%.9g", i ? "," : "", dit->sigmas.video[i]);
         fprintf(stderr, "],\"audio_sigmas\":[");

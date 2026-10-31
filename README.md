@@ -4,7 +4,7 @@ Apple Silicon 原生 MiniMax-H3 影音生成：FL2VA／Ref2VA、immutable 多 Lo
 
 這份文件只放**日常用法**。完整 C API、所有速度近似、診斷與測試見 [RUNTIME_REFERENCE.md](RUNTIME_REFERENCE.md)；目前模型、共用依賴及已完成清理見 [MODEL_INVENTORY.md](MODEL_INVENTORY.md)。
 
-模型清理：先前依指示刪除4個額外風格LoRA與 **beta6** 轉換前／後權重；官方FL2VA／Ref2VA、**21個Turbo全部**及Unlocked均保留。beta6資料夾仍只剩紀錄。另依新指示安裝作者完整 **Eros Max beta5 BF16**，使用獨立runtime與明確preset，見 [beta5配置](EROS_BETA5_SETUP.md)。
+模型清理：先前依指示刪除4個額外風格LoRA與 **beta6** 轉換前／後權重；官方FL2VA／Ref2VA、**21個Turbo全部**及Unlocked均保留。beta6資料夾仍只剩紀錄。另依新指示安裝作者完整 **Eros Max beta5 BF16**，使用獨立runtime與明確preset，見 [beta5配置](EROS_BETA5_SETUP.md)；**beta7 BF16** 另有獨立runtime，建議 ER-SDE／`sgm_uniform` 8步，見 [beta7配置](EROS_BETA7_SETUP.md)。
 
 ## 開發狀態與品質界線
 

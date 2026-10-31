@@ -26,10 +26,9 @@ extern char **environ;
 
 typedef struct {
     h3_ctx *ctx;
-    const char *model_dir;
     h3_params params;
     h3_reference references[12];
-    h3_guide guides[128];
+    h3_guide guides[H3_MAX_GUIDES];
     size_t guide_count;
     char *first_frame;
     char *last_frame;
@@ -194,12 +193,8 @@ static void print_status(const h3_cli_state *state) {
     if (state->ctx->loras) h3_lora_stack_report(state->ctx->loras, stdout);
     else puts("LoRA stack: none (fixed for this context)");
     printf("Sampler: %s | scheduler: %s | video/audio shifts: %.9g/%.9g\n",
-           state->params.sampler == H3_SAMPLER_EULER ? "euler" :
-           state->params.sampler == H3_SAMPLER_LCM ? "lcm" :
-           state->params.sampler == H3_SAMPLER_ER_SDE ? "er_sde" : "res_multistep",
-           state->params.scheduler == H3_SCHEDULER_SIMPLE ? "simple" :
-           state->params.scheduler == H3_SCHEDULER_BETA ? "beta" :
-           state->params.scheduler == H3_SCHEDULER_BETA57 ? "beta57" : "serving",
+           h3_sampler_name(state->params.sampler),
+           h3_scheduler_name(state->params.scheduler),
            (double)state->params.video_shift, (double)state->params.audio_shift);
     if (state->ctx->loras)
         printf("Immutable LoRA target: %s\n",
@@ -404,6 +399,13 @@ static void set_anchor(h3_cli_state *state, int first, char *argument) {
 static int copy_file(const char *source, const char *destination) {
     FILE *input = fopen(source, "rb");
     if (!input) return 0;
+    /* "wb" on the source itself (or a link to it) would truncate the only copy. */
+    struct stat from, to;
+    if (!fstat(fileno(input), &from) && !stat(destination, &to) &&
+        from.st_dev == to.st_dev && from.st_ino == to.st_ino) {
+        fclose(input);
+        return 1;
+    }
     FILE *output = fopen(destination, "wb");
     if (!output) {
         fclose(input);
@@ -583,7 +585,7 @@ static int process_command(h3_cli_state *state, char *line, int *repeat) {
     } else if (!strcasecmp(command, "steps")) {
         set_integer(argument, "Steps", 1, H3_MAX_STEPS, &state->params.steps);
     } else if (!strcasecmp(command, "reuse")) {
-        set_integer(argument, "Reuse", 1, 32, &state->params.denoise_reuse);
+        set_integer(argument, "Reuse", 1, 3, &state->params.denoise_reuse);
     } else if (!strcasecmp(command, "layers")) {
         set_integer(argument, "Layers", H3_MIN_DIT_LAYERS,
                     H3_DEFAULT_DIT_LAYERS, &state->params.dit_layers);
@@ -659,7 +661,7 @@ static int process_command(h3_cli_state *state, char *line, int *repeat) {
         const char *names[] = {"image", "clip", "audio", "clip-audio"};
         int kind=-1; for(int i=0;i<4;i++) if(!strcasecmp(command+6,names[i])) kind=i;
         char *end=NULL; errno=0; long frame=strtol(argument,&end,10);
-        if(kind<0 || end==argument || !isspace((unsigned char)*end) || errno || frame<0 || frame>=state->params.frames || state->guide_count>=128 || !*skip_spaces(end))
+        if(kind<0 || end==argument || !isspace((unsigned char)*end) || errno || frame<0 || frame>=state->params.frames || state->guide_count>=H3_MAX_GUIDES || !*skip_spaces(end))
             fprintf(stderr,"Usage: !guide-image|clip|audio|clip-audio FRAME PATH (resolved nonnegative frame)\n");
         else {
             char *path=strdup(skip_spaces(end));
@@ -750,7 +752,6 @@ int h3_cli_run(h3_ctx *ctx, const char *model_dir,
     memset(&state, 0, sizeof(state));
     state.ctx = ctx;
     h3_cache_set_enabled(ctx, 1);
-    state.model_dir = model_dir;
     state.params = *initial;
     const h3_reference *initial_references = initial->references;
     size_t initial_reference_count = initial->reference_count;
@@ -788,7 +789,7 @@ int h3_cli_run(h3_ctx *ctx, const char *model_dir,
         }
         state.params.reference_count++;
     }
-    if(initial->guide_count>128 || (initial->guide_count && !initial->guides)) { clear_references(&state);free(state.first_frame);free(state.last_frame);return 1; }
+    if(initial->guide_count>H3_MAX_GUIDES || (initial->guide_count && !initial->guides)) { clear_references(&state);free(state.first_frame);free(state.last_frame);return 1; }
     for(size_t i=0;i<initial->guide_count;i++) {
         state.guides[i]=initial->guides[i];
         state.guides[i].path=initial->guides[i].path?strdup(initial->guides[i].path):NULL;

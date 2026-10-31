@@ -4,7 +4,7 @@ from pathlib import Path
 import struct
 import unittest
 
-spec = importlib.util.spec_from_file_location('converter', Path(__file__).parents[1] / 'tools/convert_eros_beta5.py')
+spec = importlib.util.spec_from_file_location('converter', Path(__file__).parents[1] / 'tools/convert_eros.py')
 converter = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(converter)
 
@@ -62,6 +62,12 @@ class ConverterTests(unittest.TestCase):
         self.assertEqual(len(qkv), 52)
         tensors['adaln_t_table']['shape'] = [1024, 8]
         with self.assertRaisesRegex(ValueError, 'shape'):
+            converter.make_plan(tensors, schema)
+        tensors['adaln_t_table']['shape'] = [1025, 8]
+        del tensors['adaln_basis'], tensors['adaln_mean']  # beta7 layout
+        self.assertIn('adaln_t_table', converter.make_plan(tensors, schema)[2])
+        del tensors['adaln_t_table']
+        with self.assertRaisesRegex(ValueError, 'names'):
             converter.make_plan(tensors, schema)
 
 

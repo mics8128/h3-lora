@@ -611,10 +611,37 @@ static void test_beta_schedules(void) {
     CHECK(!h3_beta_schedule_build(4,12,3,2,&s));
 }
 
+static void test_sgm_uniform_schedule(void) {
+    /* Torch float32 oracle: ComfyUI normal_scheduler(sgm=True) on
+     * ModelSamplingDiscreteFlow(shift=12); audio via minimax time_shift_sigma(12->3). */
+    const double video[8]={1,.9883927702903748,.9733877182006836,.9532368779182434,
+        .9247457385063171,.8813849687576294,.8074031472206116,.6526597738265991};
+    const double audio[8]={1,.9551333785057068,.9014211893081665,.835960328578949,
+        .7544246912002563,.650063157081604,.5117302536964417,.3196146488189697};
+    h3_sigma_schedule s;
+    CHECK(h3_scheduler_parse("sgm_uniform")==H3_SCHEDULER_SGM_UNIFORM);
+    CHECK(h3_sampler_parse("er_sde")==H3_SAMPLER_ER_SDE && h3_sampler_parse("dpm")==-1);
+    CHECK(!strcmp(h3_sampler_name(H3_SAMPLER_RES_MULTISTEP),"res_multistep") && !h3_sampler_name(4));
+    CHECK(h3_scheduler_parse("karras")==-1 && h3_scheduler_parse(NULL)==-1);
+    CHECK(!strcmp(h3_scheduler_name(H3_SCHEDULER_BETA57),"beta57") && !h3_scheduler_name(5));
+    CHECK(h3_scheduler_build(H3_SCHEDULER_SGM_UNIFORM,8,12,3,&s));CHECK(s.steps==8);
+    for(int i=0;i<8;i++) {
+        CHECK(close_enough(s.video[i],video[i],2e-7));
+        /* Comfy derives audio from float32 video sigma: a few ulps, not semantics. */
+        CHECK(close_enough(s.audio[i],audio[i],1e-6));
+    }
+    CHECK(s.video[8]==0 && s.audio[8]==0);
+    CHECK(h3_scheduler_build(H3_SCHEDULER_SGM_UNIFORM,4,1,1,&s));
+    CHECK(close_enough(s.video[3],.25075000524520874,2e-7));
+    CHECK(!h3_scheduler_build(H3_SCHEDULER_SGM_UNIFORM,0,12,3,&s));
+    CHECK(!h3_scheduler_build(5,8,12,3,&s));
+}
+
 int main(void) {
     test_temporal_and_canvas();
     test_schedule();
     test_beta_schedules();
+    test_sgm_uniform_schedule();
     test_dit_reuse_schedule();
     test_layout_tiny();
     test_layout_fl2va();

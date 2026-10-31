@@ -44,7 +44,7 @@ static void usage(const char *program) {
         "      --lora PATH STRENGTH  Add immutable adapter (repeatable)\n"
         "      --lora-model fl2va|ref2va  Immutable adapter target (default fl2va)\n"
         "      --sampler euler|lcm|res_multistep|er_sde  Default euler\n"
-        "      --scheduler serving|simple|beta|beta57  Default serving; serving requires Euler\n"
+        "      --scheduler serving|simple|beta|beta57|sgm_uniform  Default serving; serving requires Euler\n"
         "      --video-shift FLOAT --audio-shift FLOAT  Defaults 12 and 3\n"
         "      --use-int8-row-fc2 Faster one-scale int8 FC2 (M5)\n"
         "      --use-reference-rope  Disable native 256 RoPE adaptation\n"
@@ -368,7 +368,7 @@ int main(int argc, char **argv) {
     h3_lora_model lora_target = H3_LORA_FL2VA;
     h3_reference references[12];
     size_t reference_count = 0;
-    h3_guide guides[130];
+    h3_guide guides[H3_MAX_GUIDES];
     size_t guide_count = 0;
     cli_state cli = {{0}, 0, -1, -1, H3_TERM_NONE, 0, NULL, 0};
     int show = 0;
@@ -381,7 +381,7 @@ int main(int argc, char **argv) {
     while ((option = getopt_long(argc, argv, "d:p:o:h", options, NULL)) != -1) {
         switch (option) {
             case OPT_GUIDE_IMAGE: case OPT_GUIDE_CLIP: case OPT_GUIDE_AUDIO: case OPT_GUIDE_CLIP_AUDIO:
-                if(guide_count>=128 || optind>=argc) { fprintf(stderr,"h3: guide requires FRAME PATH (maximum 128 guides)\n");return 2; }
+                if(guide_count>=H3_MAX_GUIDES || optind>=argc) { fprintf(stderr,"h3: guide requires FRAME PATH (maximum 64 guides)\n");return 2; }
                 guides[guide_count++]=(h3_guide){.kind=(h3_guide_kind)(option-OPT_GUIDE_IMAGE),.frame_index=parse_int(optarg,"guide frame"),.path=argv[optind++],.include_embedded_audio=option==OPT_GUIDE_CLIP_AUDIO};
                 break;
             case OPT_GUIDE_SOURCE_START: case OPT_GUIDE_SOURCE_FRAMES:
@@ -399,18 +399,18 @@ int main(int argc, char **argv) {
             case OPT_VIDEO_SHIFT: params.video_shift = parse_shift(optarg); break;
             case OPT_AUDIO_SHIFT: params.audio_shift = parse_shift(optarg); break;
             case OPT_SAMPLER:
-                if (!strcmp(optarg, "euler")) params.sampler = H3_SAMPLER_EULER;
-                else if (!strcmp(optarg, "lcm")) params.sampler = H3_SAMPLER_LCM;
-                else if (!strcmp(optarg, "res_multistep")) params.sampler = H3_SAMPLER_RES_MULTISTEP;
-                else if (!strcmp(optarg, "er_sde")) params.sampler = H3_SAMPLER_ER_SDE;
-                else { fprintf(stderr, "h3: unknown sampler: %s\n", optarg); return 2; }
+            {
+                int kind = h3_sampler_parse(optarg);
+                if (kind < 0) { fprintf(stderr, "h3: unknown sampler: %s\n", optarg); return 2; }
+                params.sampler = kind;
+            }
                 break;
             case OPT_SCHEDULER:
-                if (!strcmp(optarg, "serving")) params.scheduler = H3_SCHEDULER_SERVING;
-                else if (!strcmp(optarg, "simple")) params.scheduler = H3_SCHEDULER_SIMPLE;
-                else if (!strcmp(optarg, "beta")) params.scheduler = H3_SCHEDULER_BETA;
-                else if (!strcmp(optarg, "beta57")) params.scheduler = H3_SCHEDULER_BETA57;
-                else { fprintf(stderr, "h3: unknown scheduler: %s\n", optarg); return 2; }
+            {
+                int kind = h3_scheduler_parse(optarg);
+                if (kind < 0) { fprintf(stderr, "h3: unknown scheduler: %s\n", optarg); return 2; }
+                params.scheduler = kind;
+            }
                 break;
             case OPT_LORA_MODEL:
                 if (!strcmp(optarg, "fl2va")) lora_target = H3_LORA_FL2VA;
@@ -610,7 +610,7 @@ int main(int argc, char **argv) {
         (params.scheduler != H3_SCHEDULER_SERVING &&
          (params.denoise_reuse != 1 || params.core_reuse != 1 || params.token_reduction ||
           params.dit_layers != H3_DEFAULT_DIT_LAYERS || params.render_width || params.render_height))) {
-        fprintf(stderr, "h3: serving requires Euler; simple/beta/beta57 require full canvas, 50 blocks, no token reduction, reuse/core-reuse 1\n");
+        fprintf(stderr, "h3: serving requires Euler; explicit schedulers require full canvas, 50 blocks, no token reduction, reuse/core-reuse 1\n");
         return 2;
     }
     if (active_loras && (params.ssd_streaming ||

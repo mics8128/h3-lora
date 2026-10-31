@@ -229,6 +229,61 @@ int h3_serving_schedule_build(int evaluations, float video_shift,
     return 1;
 }
 
+static int h3_sgm_uniform_schedule_build(int steps, float video_shift,
+                                         float audio_shift,
+                                         h3_sigma_schedule *schedule) {
+    if (!schedule || steps < 1 || steps > H3_MAX_STEPS ||
+        !isfinite(video_shift) || !isfinite(audio_shift) ||
+        video_shift <= 0 || audio_shift <= 0) return 0;
+    memset(schedule, 0, sizeof(*schedule));
+    schedule->steps = steps;
+    /* Audio follows time_shift_sigma(video), i.e. the same unshifted base. */
+    float floor = video_shift * 0.001f / (1.0f + (video_shift - 1.0f) * 0.001f);
+    for (int index = 0; index < steps; index++) {
+        float base = (float)(1.0 - (double)index * (1.0 - floor) / steps);
+        schedule->video[index] = video_shift * base / (1.0f + (video_shift - 1.0f) * base);
+        schedule->audio[index] = audio_shift * base / (1.0f + (audio_shift - 1.0f) * base);
+    }
+    return 1;
+}
+
+#define NAMES_COUNT(t) ((int)(sizeof(t) / sizeof(*(t))))
+static const char *const sampler_names[] = {
+    "euler", "lcm", "res_multistep", "er_sde"};
+static const char *const scheduler_names[] = {
+    "serving", "simple", "beta", "beta57", "sgm_uniform"};
+
+static int names_parse(const char *const *names, int count, const char *name) {
+    for (int i = 0; name && i < count; i++)
+        if (!strcmp(name, names[i])) return i;
+    return -1;
+}
+
+int h3_sampler_parse(const char *name) {
+    return names_parse(sampler_names, NAMES_COUNT(sampler_names), name);
+}
+const char *h3_sampler_name(int kind) {
+    return kind >= 0 && kind < NAMES_COUNT(sampler_names) ? sampler_names[kind] : NULL;
+}
+int h3_scheduler_parse(const char *name) {
+    return names_parse(scheduler_names, NAMES_COUNT(scheduler_names), name);
+}
+const char *h3_scheduler_name(int kind) {
+    return kind >= 0 && kind < NAMES_COUNT(scheduler_names) ? scheduler_names[kind] : NULL;
+}
+
+int h3_scheduler_build(int kind, int steps, float video_shift,
+                       float audio_shift, h3_sigma_schedule *schedule) {
+    switch (kind) {
+        case 0: return h3_serving_schedule_build(steps, video_shift, audio_shift, schedule);
+        case 1: return h3_schedule_build(steps, video_shift, audio_shift, schedule);
+        case 2: case 3:
+            return h3_beta_schedule_build(steps, video_shift, audio_shift, kind == 3, schedule);
+        case 4: return h3_sgm_uniform_schedule_build(steps, video_shift, audio_shift, schedule);
+    }
+    return 0;
+}
+
 typedef struct {
     h3_layout *layout;
     size_t position_capacity;

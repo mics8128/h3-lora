@@ -32,7 +32,7 @@ static void check_case(h3_tokenizer *tokenizer, const char *text,
 
 int main(int argc, char **argv) {
     const char *path = argc > 1 ? argv[1] :
-                                  "MiniMax-H3/tokenizer/tokenizer.json";
+                                  "MiniMax-H3/FL2VA/tokenizer/tokenizer.json";
     char error[512];
     h3_tokenizer *tokenizer = h3_tokenizer_load(path, error, sizeof(error));
     if (!tokenizer) {

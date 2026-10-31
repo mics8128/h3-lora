@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""Lossless-layout conversion of author BF16 Eros beta5; never reads base payloads.
+"""Lossless-layout conversion of author BF16 Eros rank8-curve releases (beta5, beta7).
+
+Never reads base payloads.
 
 Official headers are a shape/dtype contract only. Curve-form AdaLN is retained,
 not expanded or replaced. ComfyUI comfy/ldm/minimax/model.py consumes table
@@ -15,9 +17,13 @@ from pathlib import Path
 import struct
 import sys
 
-SOURCE_SHA256 = '098f138f3e899d03821dd8296c8db3db6fa16371e50fcdd38661d347fd9a1dfa'
-SOURCE_BYTES = 40222982192
+# sha256 -> (bytes, label); only author BF16 rank8-curve files with known headers.
+SOURCES = {
+    '098f138f3e899d03821dd8296c8db3db6fa16371e50fcdd38661d347fd9a1dfa': (40222982192, 'beta5'),
+    'b1361691a953ff7623e5dc628a76e338d592da12e3c9d5652cecb7eeaaa4aa94': (40222934448, 'beta7'),
+}
 CHUNK = 8 * 1024 * 1024
+# beta7 drops basis/mean: provenance only, neither Comfy nor h3.c reads them.
 EXTRAS = {'adaln_basis': [8, 2688], 'adaln_mean': [2688], 'adaln_t_table': [1025, 8]}
 TIME_KEYS = {'time_embedder.proj_in.bias', 'time_embedder.proj_in.weight',
              'time_embedder.proj_out.bias', 'time_embedder.proj_out.weight'}
@@ -72,7 +78,9 @@ def validate_source(header, payload_size):
 
 def make_plan(tensors, schema):
     schema = {k: v for k, v in schema.items() if k != '__metadata__'}
-    if set(schema) - set(tensors) != TIME_KEYS or set(tensors) - set(schema) != set(EXTRAS):
+    extras = set(tensors) - set(schema)
+    if (set(schema) - set(tensors) != TIME_KEYS or not extras <= set(EXTRAS)
+            or 'adaln_t_table' not in extras):
         raise ValueError('unexpected source/schema tensor names')
     output, qkv, widened = {}, [], []
     offset = 0
@@ -150,7 +158,7 @@ def digest(stream):
     return result.hexdigest()
 
 
-def convert(source, schema_path, output, expected_sha256=SOURCE_SHA256):
+def convert(source, schema_path, output, expected_sha256=None):
     source, schema_path, output = map(Path, (source, schema_path, output))
     schema_bytes = schema_path.read_bytes()
     schema = json.loads(schema_bytes, object_pairs_hook=unique_object)
@@ -159,10 +167,11 @@ def convert(source, schema_path, output, expected_sha256=SOURCE_SHA256):
     with source.open('rb') as src:
         before = source.stat()
         source_hash = digest(src)
-        if source_hash != expected_sha256:
-            raise ValueError(f'source SHA256 mismatch: {source_hash}')
-        if expected_sha256 == SOURCE_SHA256 and before.st_size != SOURCE_BYTES:
-            raise ValueError('official beta5 source size mismatch')
+        if not (source_hash == expected_sha256 if expected_sha256 else source_hash in SOURCES):
+            raise ValueError(f'source SHA256 mismatch or unknown release: {source_hash}')
+        size, label = SOURCES.get(source_hash, (before.st_size, 'custom'))
+        if before.st_size != size:
+            raise ValueError(f'official {label} source size mismatch')
         src.seek(0)
         header, base = read_header(src)
         tensors = validate_source(header, before.st_size - base)
@@ -170,7 +179,7 @@ def convert(source, schema_path, output, expected_sha256=SOURCE_SHA256):
         plan['__metadata__'] = {
             'source_filename': source.name, 'source_sha256': source_hash,
             'schema_sha256': hashlib.sha256(schema_bytes).hexdigest(),
-            'conversion': 'h3.c beta5 rank8-v1; QKV band/head permutation; exact BF16 widening; no base payloads',
+            'conversion': f'h3.c {label} rank8-v1; QKV band/head permutation; exact BF16 widening; no base payloads',
             'adaln_mode': 'curve_rank8_no_silu',
             'original_metadata': json.dumps(header.get('__metadata__', {}), sort_keys=True),
             'reference_loader': 'https://github.com/Comfy-Org/ComfyUI/blob/fe298e4e20f1ff26d30e8639267bbd0b57811390/comfy/ldm/minimax/model.py',
@@ -218,7 +227,7 @@ def main():
     parser.add_argument('--source', required=True, type=Path)
     parser.add_argument('--schema', required=True, type=Path)
     parser.add_argument('--output', required=True, type=Path)
-    parser.add_argument('--expected-sha256', default=SOURCE_SHA256)
+    parser.add_argument('--expected-sha256', help='pin a hash; default accepts known author releases')
     args = parser.parse_args()
     try:
         print(json.dumps(convert(args.source, args.schema, args.output, args.expected_sha256), indent=2))

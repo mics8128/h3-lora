@@ -920,7 +920,7 @@ CREATE TABLE IF NOT EXISTS fingerprints(path TEXT PRIMARY KEY, signature TEXT NO
                                 'target_stream_spans': spans})
         encode_source = None
         for key, native_key, capability in [('initial_latent', 'initial_latent_path', 'initial_latent'),
-                                             ('mask', 'mask_path', 'masks'), ('checkpoint', 'resume_path', 'resume')]:
+                                             ('mask', 'mask_path', 'masks')]:
             if key in task:
                 self.required(native, capability, 'task.' + key)
                 a = self.asset(task[key], 'task.' + key)

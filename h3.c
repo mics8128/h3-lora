@@ -782,7 +782,7 @@ static int h3_valid_params(h3_ctx *ctx, const h3_params *params) {
     if (params->sampler < H3_SAMPLER_EULER ||
         params->sampler > H3_SAMPLER_ER_SDE ||
         params->scheduler < H3_SCHEDULER_SERVING ||
-        params->scheduler > H3_SCHEDULER_BETA57 ||
+        params->scheduler > H3_SCHEDULER_SGM_UNIFORM ||
         !isfinite(params->video_shift) || params->video_shift <= 0.0f ||
         !isfinite(params->audio_shift) || params->audio_shift <= 0.0f) {
         h3_set_error(ctx, "invalid sampler, scheduler, or finite positive shifts");
@@ -794,12 +794,12 @@ static int h3_valid_params(h3_ctx *ctx, const h3_params *params) {
          (params->denoise_reuse != 1 || params->core_reuse != 1 ||
           params->token_reduction || params->dit_layers != H3_DEFAULT_DIT_LAYERS ||
           params->render_width || params->render_height))) {
-        h3_set_error(ctx, "serving requires Euler; simple/beta/beta57 require full canvas, 50 blocks, no token reduction, reuse/core-reuse 1");
+        h3_set_error(ctx, "serving requires Euler; explicit schedulers require full canvas, 50 blocks, no token reduction, reuse/core-reuse 1");
         return 0;
     }
     if (params->steps < (params->scheduler == H3_SCHEDULER_SERVING ? 2 : 1) ||
         params->steps > H3_MAX_STEPS) {
-        h3_set_error(ctx, "denoising steps must be in [2, 1000] for serving or [1, 1000] for simple/beta/beta57");
+        h3_set_error(ctx, "denoising steps must be in [2, 1000] for serving or [1, 1000] for explicit schedulers");
         return 0;
     }
     if (params->denoise_reuse < 1 || params->denoise_reuse > 3) {
@@ -871,7 +871,7 @@ static int h3_valid_params(h3_ctx *ctx, const h3_params *params) {
         h3_set_error(ctx, "unknown reference image sizing policy");
         return 0;
     }
-    if ((params->guide_count && !params->guides) || params->guide_count > 64) {
+    if ((params->guide_count && !params->guides) || params->guide_count > H3_MAX_GUIDES) {
         h3_set_error(ctx, "guides must contain at most 64 descriptors"); return 0;
     }
     for (size_t i=0; i<params->guide_count; i++) {
@@ -1257,12 +1257,8 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
         return NULL;
     }
     h3_sigma_schedule sigmas;
-    int schedule_ok=params->scheduler==H3_SCHEDULER_SERVING ?
-        h3_serving_schedule_build(params->steps,params->video_shift,params->audio_shift,&sigmas) :
-        params->scheduler==H3_SCHEDULER_SIMPLE ?
-        h3_schedule_build(params->steps,params->video_shift,params->audio_shift,&sigmas) :
-        h3_beta_schedule_build(params->steps,params->video_shift,params->audio_shift,
-                               params->scheduler==H3_SCHEDULER_BETA57,&sigmas);
+    int schedule_ok=h3_scheduler_build(params->scheduler,params->steps,
+                                       params->video_shift,params->audio_shift,&sigmas);
     if(!schedule_ok || params->start_transition>sigmas.steps) {
         h3_set_error(ctx,"invalid_request: cannot construct schedule or start exceeds effective transitions");
         return NULL;

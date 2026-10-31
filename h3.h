@@ -16,6 +16,7 @@ extern "C" {
 #define H3_DEFAULT_STEPS 20
 #define H3_DEFAULT_DIT_LAYERS 50
 #define H3_MIN_DIT_LAYERS 35
+#define H3_MAX_GUIDES 64
 
 typedef struct h3_ctx h3_ctx;
 typedef struct h3_result h3_result;
@@ -23,7 +24,8 @@ typedef struct h3_result h3_result;
 typedef enum { H3_SAMPLER_EULER = 0, H3_SAMPLER_LCM = 1,
                H3_SAMPLER_RES_MULTISTEP = 2, H3_SAMPLER_ER_SDE = 3 } h3_sampler_kind;
 typedef enum { H3_SCHEDULER_SERVING = 0, H3_SCHEDULER_SIMPLE = 1,
-               H3_SCHEDULER_BETA = 2, H3_SCHEDULER_BETA57 = 3 } h3_scheduler_kind;
+               H3_SCHEDULER_BETA = 2, H3_SCHEDULER_BETA57 = 3,
+               H3_SCHEDULER_SGM_UNIFORM = 4 } h3_scheduler_kind;
 typedef enum { H3_LORA_FL2VA = 0, H3_LORA_REF2VA = 1 } h3_lora_model;
 
 typedef struct {

@@ -60,13 +60,16 @@ initialize with `H3_PARAMS_DEFAULT` to retain Euler/serving/12/3 behavior.
 
 ## Turbo sampler selection
 
-`--sampler euler|lcm|res_multistep|er_sde --scheduler serving|simple|beta|beta57`
+`--sampler euler|lcm|res_multistep|er_sde --scheduler serving|simple|beta|beta57|sgm_uniform`
 and `--video-shift FLOAT --audio-shift FLOAT` expose explicit numerical contracts.
 The default Euler/serving/12/3 retains the existing GPU path and initialization.
 Serving supports Euler only. Simple uses the discrete 1,000-entry Comfy schedule;
 beta and beta57 use Beta(.6,.6) and Beta(.5,.7) quantiles on its999-index grid,
 ties-to-even, adjacent deduplication and terminal zero. Effective transitions
-can be fewer than requested. These explicit grids use packed audiovisual state,
+can be fewer than requested. `sgm_uniform` is Comfy's `normal_scheduler(sgm=True)`
+on DiscreteFlow: timesteps linear from sigma_max to the video-shifted sigma_min,
+endpoint dropped, terminal zero, audio on the same unshifted base (matches a Torch
+float32 oracle within 2e-7 video / 1e-6 audio). These explicit grids use packed audiovisual state,
 not independent native audio/video clocks, and require50blocks, full canvas,
 no token reduction and `--reuse 1 --core-reuse 1`.
 LCM and ER-SDE use run-local seeded noise, not PyTorch-identical Gaussian draws.

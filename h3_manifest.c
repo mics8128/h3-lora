@@ -418,31 +418,16 @@ int h3_cli_capabilities(void) {
         quote(names[i]);
         fputs(",\"availability\":\"available\",\"quality_evidence\":\"unverified\",\"requires_model\":true}",stdout);
     }
-    puts("},\"samplers\":[\"euler\",\"lcm\",\"res_multistep\",\"er_sde\"],\"schedulers\":[\"serving\",\"simple\",\"beta\",\"beta57\"],\"constraints\":{\"default_execution\":\"ordinary_throughput\",\"pause_requires_control_path\":true,\"stateful_execution\":\"explicit_control_checkpoint_initial_mask_or_resume\",\"exact_resume_requires_uncached\":true,\"resume_requires_compatible_checkpoint\":true,\"control_schema\":{\"action\":[\"run\",\"pause\",\"cancel\"]}}}");
+    puts("},\"samplers\":[\"euler\",\"lcm\",\"res_multistep\",\"er_sde\"],\"schedulers\":[\"serving\",\"simple\",\"beta\",\"beta57\",\"sgm_uniform\"],\"constraints\":{\"default_execution\":\"ordinary_throughput\",\"pause_requires_control_path\":true,\"stateful_execution\":\"explicit_control_checkpoint_initial_mask_or_resume\",\"exact_resume_requires_uncached\":true,\"resume_requires_compatible_checkpoint\":true,\"control_schema\":{\"action\":[\"run\",\"pause\",\"cancel\"]}}}");
     return 0;
 }
-static int resolve_schedule(const h3_params *p, h3_sigma_schedule *schedule) {
-    switch (p->scheduler) {
-        case H3_SCHEDULER_SERVING:
-            return h3_serving_schedule_build(p->steps, p->video_shift, p->audio_shift, schedule);
-        case H3_SCHEDULER_SIMPLE:
-            return h3_schedule_build(p->steps, p->video_shift, p->audio_shift, schedule);
-        case H3_SCHEDULER_BETA: case H3_SCHEDULER_BETA57:
-            return h3_beta_schedule_build(p->steps, p->video_shift, p->audio_shift,
-                                         p->scheduler == H3_SCHEDULER_BETA57, schedule);
-    }
-    return 0;
-}
-
 /* Planning uses the same native schedule, including beta-grid deduplication. */
 int h3_cli_schedule(const char *name, const char *steps,
                     const char *video_shift, const char *audio_shift) {
     h3_params p = H3_PARAMS_DEFAULT;
-    if (!strcmp(name, "serving")) p.scheduler = H3_SCHEDULER_SERVING;
-    else if (!strcmp(name, "simple")) p.scheduler = H3_SCHEDULER_SIMPLE;
-    else if (!strcmp(name, "beta")) p.scheduler = H3_SCHEDULER_BETA;
-    else if (!strcmp(name, "beta57")) p.scheduler = H3_SCHEDULER_BETA57;
-    else return fail("invalid_request", "params.scheduler", "Unknown scheduler");
+    int kind = h3_scheduler_parse(name);
+    if (kind < 0) return fail("invalid_request", "params.scheduler", "Unknown scheduler");
+    p.scheduler = kind;
     char *end;
     errno = 0;
     long count = strtol(steps, &end, 10);
@@ -459,7 +444,7 @@ int h3_cli_schedule(const char *name, const char *steps,
             return fail("invalid_request", fields[i], "Shift must be positive and finite");
     }
     h3_sigma_schedule schedule;
-    if (!resolve_schedule(&p, &schedule))
+    if (!h3_scheduler_build(p.scheduler, p.steps, p.video_shift, p.audio_shift, &schedule))
         return fail("invalid_request", "params.steps", "Cannot construct the native schedule");
     printf("{\"schema_version\":1,\"requested_steps\":%d,\"transitions\":%d,\"video\":[",
            p.steps, schedule.steps);
@@ -571,21 +556,13 @@ int h3_cli_manifest(const char *path) {
     }
     n=member(d,po,"sampler");
     if(n) {
-        const char *s=text(d,n);
-        if(s&&!strcmp(s,"euler"))p.sampler=H3_SAMPLER_EULER;
-        else if(s&&!strcmp(s,"lcm"))p.sampler=H3_SAMPLER_LCM;
-        else if(s&&!strcmp(s,"res_multistep"))p.sampler=H3_SAMPLER_RES_MULTISTEP;
-        else if(s&&!strcmp(s,"er_sde"))p.sampler=H3_SAMPLER_ER_SDE;
-        else d->failed=1;
+        int kind=h3_sampler_parse(text(d,n));
+        if(kind<0)d->failed=1;else p.sampler=kind;
     }
     n=member(d,po,"scheduler");
     if(n) {
-        const char *s=text(d,n);
-        if(s&&!strcmp(s,"serving"))p.scheduler=H3_SCHEDULER_SERVING;
-        else if(s&&!strcmp(s,"simple"))p.scheduler=H3_SCHEDULER_SIMPLE;
-        else if(s&&!strcmp(s,"beta"))p.scheduler=H3_SCHEDULER_BETA;
-        else if(s&&!strcmp(s,"beta57"))p.scheduler=H3_SCHEDULER_BETA57;
-        else d->failed=1;
+        int kind=h3_scheduler_parse(text(d,n));
+        if(kind<0)d->failed=1;else p.scheduler=kind;
     }
     n=member(d,po,"reference_image_size");
     if(n) {
@@ -718,7 +695,8 @@ int h3_cli_manifest(const char *path) {
     if (op && (!strcmp(op,"generate") || !strcmp(op,"resume"))) {
         if (!p.output_path && !p.latent_output_path) d->failed=1;
         h3_sigma_schedule schedule;
-        if (!resolve_schedule(&p, &schedule) || p.start_transition > schedule.steps) d->failed=1;
+        if (!h3_scheduler_build(p.scheduler, p.steps, p.video_shift, p.audio_shift, &schedule) ||
+            p.start_transition > schedule.steps) d->failed=1;
         else {
             int terminal_decode = p.initial_latent_path && p.start_transition == schedule.steps;
             if (!terminal_decode && target &&

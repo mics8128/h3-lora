@@ -136,13 +136,13 @@ test: h3_sampler_tests h3_dit_curves_tests h3_lora_tests h3_reduction_tests h3_v
 	./h3_vae_precision_tests
 	@if test -f misc/fixtures/h3_dit.safetensors && \
 	         test -f misc/fixtures/h3_dit_bf16.safetensors; then \
-		./h3_metal_tests misc/fixtures/h3_dit.safetensors; \
+		./h3_metal_tests misc/fixtures/h3_dit.safetensors && \
 		./h3_bf16_tests misc/fixtures/h3_dit_bf16.safetensors; \
 	else \
 		echo "skip: MLX toy-block fixtures are not installed"; \
 	fi
-	@if test -f MiniMax-H3/tokenizer/tokenizer.json; then \
-		./h3_tokenizer_tests MiniMax-H3/tokenizer/tokenizer.json; \
+	@if test -f MiniMax-H3/FL2VA/tokenizer/tokenizer.json; then \
+		./h3_tokenizer_tests MiniMax-H3/FL2VA/tokenizer/tokenizer.json; \
 	else \
 		echo "skip: released tokenizer is not installed"; \
 	fi

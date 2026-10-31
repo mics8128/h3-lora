@@ -134,6 +134,18 @@ int h3_beta_schedule_build(int steps, float video_shift, float audio_shift,
 /* Released linear base grid: evaluations model forwards plus terminal zero. */
 int h3_serving_schedule_build(int evaluations, float video_shift,
                               float audio_shift, h3_sigma_schedule *schedule);
+/* Sampler/scheduler kinds and names follow h3_sampler_kind and
+ * h3_scheduler_kind; parse returns -1 and name/build fail (NULL/0) for
+ * unknown kinds. build is the effective grid before sampler-specific
+ * first-sigma offsets. sgm_uniform is Comfy's normal_scheduler(sgm=True)
+ * on DiscreteFlow: linear timesteps from sigma_max to the video sigma_min,
+ * endpoint dropped, terminal zero. */
+int h3_sampler_parse(const char *name);
+const char *h3_sampler_name(int kind);
+int h3_scheduler_parse(const char *name);
+const char *h3_scheduler_name(int kind);
+int h3_scheduler_build(int kind, int steps, float video_shift,
+                       float audio_shift, h3_sigma_schedule *schedule);
 
 int h3_layout_build(const h3_layout_spec *spec, h3_layout *layout,
                     char *error, size_t error_size);
