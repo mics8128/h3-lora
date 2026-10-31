@@ -13,10 +13,9 @@ typedef struct {
     size_t count;
 } test_context;
 
-static void die(const char *message) {
-    fprintf(stderr, "FAIL tests/test_audio_gpu.c: %s\n", message);
-    exit(1);
-}
+#define die(message) do { \
+    fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, (message)); exit(1); \
+} while (0)
 
 static h3_gpu_tensor *own(test_context *test, h3_gpu_tensor *tensor) {
     if (!tensor || test->count == MAX_TENSORS) die("tensor allocation failed");
@@ -26,7 +25,7 @@ static h3_gpu_tensor *own(test_context *test, h3_gpu_tensor *tensor) {
 
 static void gpu_ok(test_context *test, int ok, const char *operation) {
     if (!ok) {
-        fprintf(stderr, "FAIL tests/test_audio_gpu.c: %s: %s\n", operation,
+        fprintf(stderr, "FAIL %s:%d: %s: %s\n", __FILE__, __LINE__, operation,
                 h3_gpu_error(test->gpu));
         exit(1);
     }
@@ -39,6 +38,8 @@ static void compare(h3_gpu_tensor *tensor, const float *expected, size_t count,
         die("cannot read result");
     float maximum = 0.0f;
     for (size_t index = 0; index < count; index++) {
+        if (!isfinite(got[index]) || !isfinite(expected[index]))
+            die("non-finite comparison value");
         float error = fabsf(got[index] - expected[index]);
         if (error > maximum) maximum = error;
     }

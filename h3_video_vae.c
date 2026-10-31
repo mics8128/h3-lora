@@ -733,10 +733,9 @@ static int unpack_frame_range(vae_context *vae, int first_frame,
                     size_t component = ((((size_t)channel * 4 +
                         (size_t)within_t) * 16 + (size_t)within_y) * 16 +
                         (size_t)within_x);
+                    /* Unclamped: Comfy blends raw tiles/chunks, then clamps (clamp_pixels). */
                     float value = rows[patch * OUTPUT_PATCH + component] *
                                   deviation[channel] + mean[channel];
-                    if (value < 0.0f) value = 0.0f;
-                    if (value > 1.0f) value = 1.0f;
                     size_t destination = (((size_t)output_frame *
                         (size_t)pixel_h +
                         (size_t)y) * (size_t)pixel_w + (size_t)x) * 3 +
@@ -752,6 +751,14 @@ static int unpack_frame_range(vae_context *vae, int first_frame,
     output->width = pixel_w;
     output->rgb = rgb;
     return h3_gpu_get_stats(vae->gpu, &output->gpu_stats);
+}
+
+/* Comfy _finalize_pixels: clamp only after every spatial/temporal blend. */
+static void clamp_pixels(h3_video_frames *frames) {
+    size_t count = (size_t)frames->frames * (size_t)frames->height *
+                   (size_t)frames->width * 3;
+    for (size_t index = 0; index < count; index++)
+        frames->rgb[index] = fminf(fmaxf(frames->rgb[index], 0.0f), 1.0f);
 }
 
 static int unpack_frames(vae_context *vae, h3_video_frames *output,
@@ -883,55 +890,58 @@ static int stitch_tiles(float **tiles, const tile_axis *y_axis,
         fail(error, error_size, "out of memory stitching video VAE tiles");
         return 0;
     }
+    size_t row = (size_t)x_axis->length * 3;
+    size_t tile_frame = (size_t)y_axis->length * row;
+    /* Comfy tiled_decode order: blend against the above row as composited,
+     * then against the already blended left tile, so crossing seams agree. */
     for (int tile_y = 0; tile_y < y_axis->count; tile_y++)
         for (int tile_x = 0; tile_x < x_axis->count; tile_x++) {
             int index = tile_y * x_axis->count + tile_x;
-            const float *current = tiles[index];
-            const float *above = tile_y ? tiles[index - x_axis->count] : NULL;
-            const float *left = tile_x ? tiles[index - 1] : NULL;
+            float *current = tiles[index];
             int overlap_y = tile_y ? y_axis->overlaps[tile_y - 1] : 0;
             int overlap_x = tile_x ? x_axis->overlaps[tile_x - 1] : 0;
             int keep_h = y_axis->length -
                 (tile_y + 1 < y_axis->count ? y_axis->overlaps[tile_y] : 0);
             int keep_w = x_axis->length -
                 (tile_x + 1 < x_axis->count ? x_axis->overlaps[tile_x] : 0);
-            for (int frame = 0; frame < frame_count; frame++)
+            for (int frame = 0; frame < frame_count; frame++) {
+                float *tile = current + (size_t)frame * tile_frame;
+                for (int y = 0; y < overlap_y; y++) {
+                    float alpha = (float)y / (float)overlap_y;
+                    size_t above_y = (size_t)(y_axis->length - overlap_y + y);
+                    for (int x = 0; x < x_axis->length; x++) {
+                        int column = x_axis->starts[tile_x] + x;
+                        int owner = x_axis->count - 1;
+                        while (x_axis->starts[owner] > column) owner--;
+                        const float *above =
+                            tiles[(tile_y - 1) * x_axis->count + owner] +
+                            (size_t)frame * tile_frame + above_y * row +
+                            (size_t)(column - x_axis->starts[owner]) * 3;
+                        float *value = tile + (size_t)y * row + (size_t)x * 3;
+                        for (int channel = 0; channel < 3; channel++)
+                            value[channel] = above[channel] * (1.0f - alpha) +
+                                             value[channel] * alpha;
+                    }
+                }
+                const float *left = overlap_x ?
+                    tiles[index - 1] + (size_t)frame * tile_frame : NULL;
+                for (int y = 0; left && y < y_axis->length; y++)
+                    for (int x = 0; x < overlap_x; x++) {
+                        float alpha = (float)x / (float)overlap_x;
+                        const float *prior = left + (size_t)y * row +
+                            (size_t)(x_axis->length - overlap_x + x) * 3;
+                        float *value = tile + (size_t)y * row + (size_t)x * 3;
+                        for (int channel = 0; channel < 3; channel++)
+                            value[channel] = prior[channel] * (1.0f - alpha) +
+                                             value[channel] * alpha;
+                    }
                 for (int y = 0; y < keep_h; y++)
-                    for (int x = 0; x < keep_w; x++)
-                        for (int channel = 0; channel < 3; channel++) {
-                            size_t local = (((size_t)frame *
-                                (size_t)y_axis->length + (size_t)y) *
-                                (size_t)x_axis->length + (size_t)x) * 3 +
-                                (size_t)channel;
-                            float value = current[local];
-                            if (above && y < overlap_y) {
-                                size_t top = (((size_t)frame *
-                                    (size_t)y_axis->length +
-                                    (size_t)(y_axis->length - overlap_y + y)) *
-                                    (size_t)x_axis->length + (size_t)x) * 3 +
-                                    (size_t)channel;
-                                float alpha = (float)y / (float)overlap_y;
-                                value = above[top] * (1.0f - alpha) +
-                                        value * alpha;
-                            }
-                            if (left && x < overlap_x) {
-                                size_t prior = (((size_t)frame *
-                                    (size_t)y_axis->length + (size_t)y) *
-                                    (size_t)x_axis->length +
-                                    (size_t)(x_axis->length - overlap_x + x)) *
-                                    3 + (size_t)channel;
-                                float alpha = (float)x / (float)overlap_x;
-                                value = left[prior] * (1.0f - alpha) +
-                                        value * alpha;
-                            }
-                            size_t destination = (((size_t)frame *
-                                (size_t)full_h +
-                                (size_t)(y_axis->starts[tile_y] + y)) *
-                                (size_t)full_w +
-                                (size_t)(x_axis->starts[tile_x] + x)) * 3 +
-                                (size_t)channel;
-                            rgb[destination] = value;
-                        }
+                    memcpy(rgb + (((size_t)frame * (size_t)full_h +
+                               (size_t)(y_axis->starts[tile_y] + y)) *
+                               (size_t)full_w + (size_t)x_axis->starts[tile_x]) * 3,
+                           tile + (size_t)y * row,
+                           (size_t)keep_w * 3 * sizeof(*rgb));
+            }
         }
     output->frames = frame_count;
     output->height = full_h;
@@ -1083,7 +1093,10 @@ int h3_video_vae_decoder_preview(h3_video_vae_decoder *decoder,
     int ok = decoder_decode_chunk(decoder, normalized_latent, latent_time,
                                   chunk, local_frame, output,
                                   error, error_size);
-    if (ok) *output_frame_index = global_frame;
+    if (ok) {
+        clamp_pixels(output);
+        *output_frame_index = global_frame;
+    }
     return ok;
 }
 
@@ -1141,6 +1154,7 @@ int h3_video_vae_decoder_decode(h3_video_vae_decoder *decoder,
         output->width = pixel_w;
         output->rgb = final_rgb;
         final_rgb = NULL;
+        clamp_pixels(output);
         ok = h3_gpu_get_stats(decoder->vae.gpu, &output->gpu_stats);
     }
     free(final_rgb);
@@ -1280,6 +1294,7 @@ static int decode_chunked(const char *weight_directory,
         output->width = pixel_w;
         output->rgb = final_rgb;
         final_rgb = NULL;
+        clamp_pixels(output);
         ok = h3_gpu_get_stats(vae.gpu, &output->gpu_stats);
     }
     free(final_rgb);
@@ -1361,7 +1376,8 @@ int h3_video_vae_decode(const char *weight_directory,
         allocate_activations(&vae, error, error_size) &&
         run_decoder(&vae, progress, progress_opaque, error, error_size) &&
         unpack_frames(&vae, output, error, error_size);
-    if (!ok) h3_video_frames_free(output);
+    if (ok) clamp_pixels(output);
+    else h3_video_frames_free(output);
     cleanup(&vae);
     return ok;
 }

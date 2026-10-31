@@ -22,19 +22,15 @@ typedef struct {
     size_t owned_count;
 } test_context;
 
-static void die(const char *message) {
-    fprintf(stderr, "FAIL tests/test_bf16.c: %s\n", message);
-    exit(1);
-}
-
-static void require(int condition, const char *message) {
-    if (!condition) die(message);
-}
+#define die(message) do { \
+    fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, (message)); exit(1); \
+} while (0)
+#define require(condition, message) do { if (!(condition)) die(message); } while (0)
 
 static void require_gpu(test_context *test, int condition,
                         const char *operation) {
     if (condition) return;
-    fprintf(stderr, "FAIL tests/test_bf16.c: %s: %s\n", operation,
+    fprintf(stderr, "FAIL %s:%d: %s: %s\n", __FILE__, __LINE__, operation,
             h3_gpu_error(test->gpu));
     exit(1);
 }
@@ -51,7 +47,7 @@ static void *load(test_context *test, const char *name, h3_dtype dtype,
     const h3_st_tensor *tensor = h3_st_find(&test->fixture, name);
     if (!tensor || tensor->dtype != dtype ||
         h3_st_tensor_elements(tensor) != elements) {
-        fprintf(stderr, "FAIL tests/test_bf16.c: invalid or absent %s\n", name);
+        fprintf(stderr, "FAIL %s:%d: invalid or absent %s\n", __FILE__, __LINE__, name);
         exit(1);
     }
     size_t bytes = elements * h3_dtype_size(dtype);
@@ -60,7 +56,7 @@ static void *load(test_context *test, const char *name, h3_dtype dtype,
     char error[256];
     if (!h3_st_read_data(&test->fixture, tensor, data, bytes, error,
                          sizeof(error))) {
-        fprintf(stderr, "FAIL tests/test_bf16.c: %s\n", error);
+        fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, error);
         exit(1);
     }
     return data;
@@ -1148,6 +1144,8 @@ static double compare(test_context *test, const char *name,
     for (size_t index = 0; index < elements; index++) {
         double got_value = bf16_to_f32(got[index]);
         double want_value = bf16_to_f32(want[index]);
+        require(isfinite(got_value) && isfinite(want_value),
+                "non-finite comparison value");
         double delta = fabs(got_value - want_value);
         double magnitude = fabs(want_value);
         if (delta > error) error = delta;
@@ -1268,12 +1266,12 @@ int main(int argc, char **argv) {
     memset(&test, 0, sizeof(test));
     char error[512];
     if (!h3_st_read_header(path, &test.fixture, error, sizeof(error))) {
-        fprintf(stderr, "FAIL tests/test_bf16.c: %s\n", error);
+        fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, error);
         return 1;
     }
     test.gpu = h3_gpu_create("h3_shaders.metal", error, sizeof(error));
     if (!test.gpu) {
-        fprintf(stderr, "FAIL tests/test_bf16.c: %s\n", error);
+        fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, error);
         h3_st_free_header(&test.fixture);
         return 1;
     }

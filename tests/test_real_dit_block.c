@@ -35,14 +35,8 @@ typedef struct {
     h3_gpu_tensor *fc2;
 } plain_block_weights;
 
-static void die(const char *message) {
-    fprintf(stderr, "FAIL tests/test_real_dit_block.c: %s\n", message);
-    exit(1);
-}
-
-static void require(int condition, const char *message) {
-    if (!condition) die(message);
-}
+#define die(message) do { fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, (message)); exit(1); } while (0)
+#define require(condition, message) do { if (!(condition)) die(message); } while (0)
 
 static h3_gpu_tensor *own(test_context *test, h3_gpu_tensor *tensor) {
     require(tensor != NULL, "Metal tensor allocation/load failed");
@@ -53,7 +47,7 @@ static h3_gpu_tensor *own(test_context *test, h3_gpu_tensor *tensor) {
 
 static void gpu_call(test_context *test, int ok, const char *operation) {
     if (ok) return;
-    fprintf(stderr, "FAIL tests/test_real_dit_block.c: %s: %s\n", operation,
+    fprintf(stderr, "FAIL %s:%d: %s: %s\n", __FILE__, __LINE__, operation,
             h3_gpu_error(test->gpu));
     exit(1);
 }
@@ -63,8 +57,7 @@ static void *fixture_load(test_context *test, const char *name,
     const h3_st_tensor *tensor = h3_st_find(&test->fixture, name);
     if (!tensor || tensor->dtype != dtype ||
         h3_st_tensor_elements(tensor) != (uint64_t)elements) {
-        fprintf(stderr, "FAIL tests/test_real_dit_block.c: bad fixture tensor %s\n",
-                name);
+        fprintf(stderr, "FAIL %s:%d: bad fixture tensor %s\n", __FILE__, __LINE__, name);
         exit(1);
     }
     size_t bytes = elements * h3_dtype_size(dtype);

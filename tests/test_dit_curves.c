@@ -3,9 +3,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-static void check(int ok, const char *message) {
-    if (!ok) { fprintf(stderr, "curve test: %s\n", message); exit(1); }
-}
+#define check(ok, message) do { if (!(ok)) { \
+    fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, (message)); exit(1); \
+} } while (0)
 
 static void fixture_data(const h3_st_header *header, const char *prefix,
                          const char *name, h3_dtype dtype, void *data, size_t bytes) {

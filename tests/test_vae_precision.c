@@ -5,12 +5,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-static void require(int ok, const char *message) {
-    if (!ok) {
-        fprintf(stderr, "FAIL tests/test_vae_precision.c: %s\n", message);
-        exit(1);
-    }
-}
+#define require(ok, message) do { if (!(ok)) { \
+    fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, (message)); exit(1); \
+} } while (0)
 
 int main(void) {
     char error[512];

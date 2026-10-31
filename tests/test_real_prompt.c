@@ -9,10 +9,7 @@
 #include <string.h>
 #include <time.h>
 
-static void fail(const char *message) {
-    fprintf(stderr, "FAIL tests/test_real_prompt.c: %s\n", message);
-    exit(1);
-}
+#define fail(message) do { fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, (message)); exit(1); } while (0)
 
 static char *path_join(const char *root, const char *suffix) {
     size_t length = strlen(root) + strlen(suffix) + 2;

@@ -566,6 +566,8 @@ See [related-project research and actual wiring results](REF_COMPATIBILITY_RESEA
 make test
 make parity
 ```
+Python tests use the standard-library unittest runner and also support pytest without making it a dependency. Run `make test-tasks` for native CLI planner coverage and `python3 -m unittest tests/test_convert_eros.py` for converter coverage. Fixture-dependent cases in `make test` print `skip:` when prerequisites are unavailable; a successful run with skips is not model-parity coverage.
+
 
 `make test` runs the deterministic host suite and, when the ignored MLX fixture
 is installed under `misc/fixtures/`, compiles the Metal source at runtime and
@@ -715,7 +717,9 @@ preview rather than a substitute for a 512- or 768-class final render.
 The video VAE automatically chooses a 256-320 pixel spatial tile from the
 requested canvas geometry, minimizing repeated overlap work while keeping peak
 storage bounded. `H3_VAE_TILE_PIXELS=256` restores the original conservative
-tile plan for close-reference diagnosis.
+tile plan for close-reference diagnosis. Tiles blend in Comfy `tiled_decode`
+order (above row as composited, then the blended left tile) on unclamped
+pixels; clamping to [0,1] happens once after spatial and temporal blending.
 
 The native video decoder defaults to F32. To opt into BF16 large projections
 and BF16 attention without changing the model, sampler, steps or canvas:

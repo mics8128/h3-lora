@@ -8,10 +8,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-static void die(const char *message) {
-    fprintf(stderr, "FAIL tests/test_real_ref_video_text.c: %s\n", message);
-    exit(1);
-}
+#define die(message) do { fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, (message)); exit(1); } while (0)
 
 static float bf16_to_f32(uint16_t value) {
     uint32_t bits = (uint32_t)value << 16;
@@ -133,6 +130,6 @@ int main(int argc, char **argv) {
     h3_st_free_header(&fixture);
     free(positions); free(tags_i32); free(vision); free(want);
     for (unsigned index = 0; index < 3; index++) free(deepstack[index]);
-    puts("ok: native Ref2VA video+audio presentation matches the MLX oracle");
+    puts("ok: native Ref2VA video presentation matches the MLX oracle");
     return 0;
 }

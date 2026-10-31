@@ -29,18 +29,14 @@ typedef struct {
     size_t tensor_count;
 } metal_test;
 
-static void fail(const char *message) {
-    fprintf(stderr, "FAIL tests/test_metal.c: %s\n", message);
-    exit(1);
-}
-
-static void require(int condition, const char *message) {
-    if (!condition) fail(message);
-}
+#define fail(message) do { \
+    fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, (message)); exit(1); \
+} while (0)
+#define require(condition, message) do { if (!(condition)) fail(message); } while (0)
 
 static void require_gpu(metal_test *test, int condition, const char *operation) {
     if (condition) return;
-    fprintf(stderr, "FAIL tests/test_metal.c: %s: %s\n", operation,
+    fprintf(stderr, "FAIL %s:%d: %s: %s\n", __FILE__, __LINE__, operation,
             h3_gpu_error(test->gpu));
     exit(1);
 }
@@ -56,12 +52,11 @@ static void *load_host(metal_test *test, const char *name, h3_dtype dtype,
                        size_t elements) {
     const h3_st_tensor *tensor = h3_st_find(&test->fixture, name);
     if (!tensor) {
-        fprintf(stderr, "FAIL tests/test_metal.c: fixture has no %s\n", name);
+        fprintf(stderr, "FAIL %s:%d: fixture has no %s\n", __FILE__, __LINE__, name);
         exit(1);
     }
     if (tensor->dtype != dtype || h3_st_tensor_elements(tensor) != elements) {
-        fprintf(stderr, "FAIL tests/test_metal.c: unexpected type/shape for %s\n",
-                name);
+        fprintf(stderr, "FAIL %s:%d: unexpected type/shape for %s\n", __FILE__, __LINE__, name);
         exit(1);
     }
     size_t item_size = h3_dtype_size(dtype);
@@ -72,7 +67,7 @@ static void *load_host(metal_test *test, const char *name, h3_dtype dtype,
     char error[256];
     if (!h3_st_read_data(&test->fixture, tensor, result, bytes, error,
                          sizeof(error))) {
-        fprintf(stderr, "FAIL tests/test_metal.c: %s\n", error);
+        fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, error);
         exit(1);
     }
     return result;
@@ -96,6 +91,8 @@ static double relative_max(const float *got, const float *want, size_t count,
     double error = 0.0;
     double scale = 0.0;
     for (size_t index = 0; index < count; index++) {
+        require(isfinite(got[index]) && isfinite(want[index]),
+                "non-finite comparison value");
         double delta = fabs((double)got[index] - want[index]);
         double magnitude = fabs((double)want[index]);
         if (delta > error) error = delta;
@@ -134,12 +131,12 @@ int main(int argc, char **argv) {
     memset(&test, 0, sizeof(test));
     char error[512];
     if (!h3_st_read_header(fixture_path, &test.fixture, error, sizeof(error))) {
-        fprintf(stderr, "FAIL tests/test_metal.c: %s\n", error);
+        fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, error);
         return 1;
     }
     test.gpu = h3_gpu_create("h3_shaders.metal", error, sizeof(error));
     if (!test.gpu) {
-        fprintf(stderr, "FAIL tests/test_metal.c: %s\n", error);
+        fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, error);
         h3_st_free_header(&test.fixture);
         return 1;
     }

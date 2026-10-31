@@ -36,7 +36,7 @@ int main(int argc, char **argv) {
     char error[512];
     h3_tokenizer *tokenizer = h3_tokenizer_load(path, error, sizeof(error));
     if (!tokenizer) {
-        fprintf(stderr, "FAIL tests/test_tokenizer.c: %s\n", error);
+        fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, error);
         return 1;
     }
     const uint32_t fox[] = {32, 2518, 38835, 11435, 1526, 11794};

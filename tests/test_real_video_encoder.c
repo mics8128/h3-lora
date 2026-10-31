@@ -6,10 +6,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-static void die(const char *message) {
-    fprintf(stderr, "FAIL tests/test_real_video_encoder.c: %s\n", message);
-    exit(1);
-}
+#define die(message) do { fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, (message)); exit(1); } while (0)
 
 static int axis_tiles(int extent) {
     if (extent <= 256) return 1;

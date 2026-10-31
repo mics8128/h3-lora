@@ -6,12 +6,9 @@
 #include <string.h>
 #include <unistd.h>
 
-static void require(int ok, const char *why) {
-    if (!ok) {
-        fprintf(stderr, "FAIL test_lora: %s\n", why);
-        exit(1);
-    }
-}
+#define require(ok, why) do { if (!(ok)) { \
+    fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, (why)); exit(1); \
+} } while (0)
 static void compose(h3_lora_target *t, size_t first, size_t rows, void *values) {
     char e[512];
     size_t n = h3_lora_scratch_bytes(t, rows);

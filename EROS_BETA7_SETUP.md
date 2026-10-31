@@ -55,3 +55,21 @@ video-maker 改用 beta7：profile 的 `engine` 指向 beta7 runtime、`ref2va_m
 四支 MP4 均完整解碼。右上樹葉區塊的相鄰影格亮度差（ffmpeg `signalstats` YDIF 平均）：beta7 Euler **11.1**、beta7 ER/sgm **7.4**、beta5 **3.5**，與作者描述的背景閃爍一致；ER-SDE/sgm_uniform 明顯較低，建議作為 beta7 預設起點。這是單一 seed 的量測，不是品質或音色認證。
 
 成品、manifest、JSONL 與 log 位於 runtime 的 `acceptance/`。
+
+## 公式查證（2026-10-31）
+
+針對「撕裂感」逐段比對 Comfy master `7c4390a6`：
+- **權重轉換**：532 個張量逐位元組相符，其中 QKV 52 個、F32 擴寬 112 個、其餘 368 個。
+- **sampler／scheduler**：用相同注入噪聲跑完整 8 步迴圈，video／audio 誤差 ≤3.6e-7。
+- **AdaLN 曲線與 rank8 投影**：用實際權重比對，誤差為 0。
+- **RoPE、位置、QKV／SwiGLU 順序**：都相符。
+- **DiT 內 BF16 中間捨入**：與 Comfy eager 有差異，原生在 F32 做融合運算，不是公式錯誤。
+
+唯一確認的錯誤在 VAE 拼接：tile 交叉點原本與未混合的鄰塊混合，而且在混合前就先 clamp，已依 Comfy 修正，合成結果誤差 ≤3.6e-7。這只影響 tile 交叉點和超出範圍的像素，時間閃爍指標不變。
+
+beta7 前約 20 幀的高變化量，在 latent 階段就已存在：前 5 個轉換的 RMS 為 0.589，同設定 beta5 為 0.475。這屬於模型行為，作者建議以 2-pass upscaler 處理。
+
+**未對齊**：
+- mask 生成的逐 token 時間步（Comfy #15375）。
+- ER-SDE 初始音訊 packing 約 2e-5 的偏差。
+- σ=0 端點的時間步差異，約 2e-6。

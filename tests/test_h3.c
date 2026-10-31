@@ -265,8 +265,7 @@ static void test_layout_mixed_guides(void) {
     CHECK(close_enough(sums[0],2606.3333333333335,1e-9));
     h3_layout_free(&l);
     guides[1].frame_index=0;
-    CHECK(!h3_layout_build(&spec,&l,error,sizeof(error)));
-    CHECK(strstr(error,"guide_overlap")!=NULL);
+    CHECK(!h3_layout_build(&spec,&l,error,sizeof(error)) && strstr(error,"guide_overlap"));
     guides[1].frame_index=20;
     CHECK(!h3_layout_build(&spec,&l,error,sizeof(error)));
     guides[1].frame_index=10; guides[1].audio_t=40;
@@ -276,8 +275,7 @@ static void test_layout_mixed_guides(void) {
     CHECK(h3_layout_build(&adjacent_spec,&l,error,sizeof(error)));
     h3_layout_free(&l);
     adjacent[1].frame_index=63;
-    CHECK(!h3_layout_build(&adjacent_spec,&l,error,sizeof(error)));
-    CHECK(strstr(error,"guide_overlap")!=NULL);
+    CHECK(!h3_layout_build(&adjacent_spec,&l,error,sizeof(error)) && strstr(error,"guide_overlap"));
 }
 
 static void test_layout_guide_error_identity(void) {
@@ -289,17 +287,15 @@ static void test_layout_guide_error_identity(void) {
     };
     h3_layout_spec spec={6,7,2,2,37,22,guides,4,NULL,0};
     h3_layout layout;char error[256];
-    CHECK(!h3_layout_build(&spec,&layout,error,sizeof(error)));
-    CHECK(!strcmp(error,"guide_overlap: guides[1] overlaps guides[0] on the same stream"));
+    /* h3_set_error derives the public error_code/error_field from these tokens. */
+    CHECK(!h3_layout_build(&spec,&layout,error,sizeof(error)) && strstr(error,"guide_overlap") && strstr(error,"guides[1]"));
     guides[3].frame_index=7;
     CHECK(h3_layout_build(&spec,&layout,error,sizeof(error)));
     h3_layout_free(&layout);
     guides[0].frame_index=-1;
-    CHECK(!h3_layout_build(&spec,&layout,error,sizeof(error)));
-    CHECK(!strcmp(error,"guide_out_of_range: params.first_frame has an invalid encoded span"));
+    CHECK(!h3_layout_build(&spec,&layout,error,sizeof(error)) && strstr(error,"guide_out_of_range") && strstr(error,"params.first_frame"));
     guides[0].frame_index=0;guides[1].frame_index=22;
-    CHECK(!h3_layout_build(&spec,&layout,error,sizeof(error)));
-    CHECK(!strcmp(error,"guide_out_of_range: params.last_frame has an invalid encoded span"));
+    CHECK(!h3_layout_build(&spec,&layout,error,sizeof(error)) && strstr(error,"guide_out_of_range") && strstr(error,"params.last_frame"));
 }
 
 static void write_all(int descriptor, const void *data, size_t size) {

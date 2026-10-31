@@ -7,10 +7,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-static void die(const char *message) {
-    fprintf(stderr, "FAIL tests/test_real_dit.c: %s\n", message);
-    exit(1);
-}
+#define die(message) do { fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, (message)); exit(1); } while (0)
 
 static void progress(const char *phase, int completed, int total, void *opaque) {
     (void)opaque;

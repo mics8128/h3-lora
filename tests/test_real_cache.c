@@ -109,7 +109,7 @@ static h3_ctx *load_context(const char *root, const char *lora, int ref2va) {
     h3_ctx *ctx = h3_load_dir(root, active ? &spec : NULL, active ? 1 : 0,
                             ref2va ? H3_LORA_REF2VA : H3_LORA_FL2VA);
     if (ctx) h3_cache_set_enabled(ctx, 1);
-    else fprintf(stderr, "FAIL: h3_load_dir\n");
+    else fprintf(stderr, "FAIL %s:%d: h3_load_dir\n", __FILE__, __LINE__);
     return ctx;
 }
 
@@ -130,12 +130,12 @@ static int generate(h3_ctx *ctx, const scenario *s, const char *dir,
     h3_result *result = h3_generate(ctx, s->prompt, &p);
     if (cancel) {
         int ok = !result && c->cancelled && !c->frames;
-        if (!ok) fprintf(stderr, "FAIL: cancellation did not stop generation\n");
+        if (!ok) fprintf(stderr, "FAIL %s:%d: cancellation did not stop generation\n", __FILE__, __LINE__);
         h3_result_free(result);
         return ok;
     }
     if (!result) {
-        fprintf(stderr, "FAIL: %s/%s: %s\n", prefix, s->name, h3_last_error(ctx));
+        fprintf(stderr, "FAIL %s:%d: %s/%s: %s\n", __FILE__, __LINE__, prefix, s->name, h3_last_error(ctx));
         return 0;
     }
     c->fps = result->fps; c->sample_rate = result->sample_rate; c->seed = result->seed;
@@ -144,7 +144,7 @@ static int generate(h3_ctx *ctx, const scenario *s, const char *dir,
         result->fps == 24 && result->sample_rate > 0 && result->seed == s->seed;
     h3_result_free(result);
     if (!ok || !audio_hash(path, c)) {
-        fprintf(stderr, "FAIL: invalid frames/metadata or decoded audio: %s\n", path);
+        fprintf(stderr, "FAIL %s:%d: invalid frames/metadata or decoded audio: %s\n", __FILE__, __LINE__, path);
         return 0;
     }
     fprintf(manifest, "%s\t%s\t%d\t%d\t%d\t%d\t%d\t%" PRIu64
@@ -209,7 +209,7 @@ int main(int argc, char **argv) {
             h3_cache_info info = {0};
             h3_cache_get_info(ctx, &info);
             if (info.prepared_dit || info.embedding_entries || info.video_decoder) {
-                fprintf(stderr, "FAIL: cache clear retained public cache entries\n");
+                fprintf(stderr, "FAIL %s:%d: cache clear retained public cache entries\n", __FILE__, __LINE__);
                 ok = 0; break;
             }
         }
@@ -225,8 +225,8 @@ int main(int argc, char **argv) {
         /* Exact full-depth native path; no gate-pruning or precision changes.
          * Recovery may legitimately reload after cancellation invalidates state. */
         if (ok && i != 8 && cases[i].warm.loads != (i == 0 || i == 7 ? 1 : 0)) {
-            fprintf(stderr, "FAIL: unexpected resident core reload in %s: %d\n",
-                    cases[i].name, cases[i].warm.loads);
+            fprintf(stderr, "FAIL %s:%d: unexpected resident core reload in %s: %d\n",
+                    __FILE__, __LINE__, cases[i].name, cases[i].warm.loads);
             ok = 0;
         }
     }
@@ -247,7 +247,7 @@ int main(int argc, char **argv) {
         }
         if (oracle >= 0) {
             if (!same(&cases[i].warm, &cases[oracle].warm)) {
-                fprintf(stderr, "FAIL: restored state differs from its fresh oracle: %s\n", cases[i].name);
+                fprintf(stderr, "FAIL %s:%d: restored state differs from its fresh oracle: %s\n", __FILE__, __LINE__, cases[i].name);
                 ok = 0;
             }
             continue;
@@ -259,21 +259,21 @@ int main(int argc, char **argv) {
         ok = generate(ctx, &cases[i], dir, "fresh", refs, count, 0, &fresh, manifest);
         h3_free(ctx);
         if (ok && (!same(&cases[i].warm, &fresh) || fresh.loads != 1)) {
-            fprintf(stderr, "FAIL: warm/fresh bytes or metadata differ: %s\n", cases[i].name);
+            fprintf(stderr, "FAIL %s:%d: warm/fresh bytes or metadata differ: %s\n", __FILE__, __LINE__, cases[i].name);
             ok = 0;
         }
     }
     if (ok && (cases[0].warm.rgb == cases[1].warm.rgb ||
                cases[0].warm.rgb == cases[2].warm.rgb ||
                cases[2].warm.rgb == cases[3].warm.rgb)) {
-        fprintf(stderr, "FAIL: changed seed/prompt/steps did not change RGB output\n");
+        fprintf(stderr, "FAIL %s:%d: changed seed/prompt/steps did not change RGB output\n", __FILE__, __LINE__);
         ok = 0;
     }
     if (ok && (!same(&cases[2].warm, &cases[4].warm) ||
                !same(&cases[2].warm, &cases[6].warm) ||
                !same(&cases[2].warm, &cases[7].warm) ||
                !same(&cases[2].warm, &cases[8].warm))) {
-        fprintf(stderr, "FAIL: restored settings/clear/cancellation changed output\n");
+        fprintf(stderr, "FAIL %s:%d: restored settings/clear/cancellation changed output\n", __FILE__, __LINE__);
         ok = 0;
     }
     if (fclose(manifest)) ok = 0;

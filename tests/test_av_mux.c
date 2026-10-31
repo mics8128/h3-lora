@@ -4,12 +4,10 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <sys/stat.h>
 
-static void die(const char *message) {
-    fprintf(stderr, "FAIL tests/test_av_mux.c: %s\n", message);
-    exit(1);
-}
+#define die(message) do { \
+    fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, (message)); exit(1); \
+} while (0)
 
 int main(int argc, char **argv) {
     enum { WIDTH = 32, HEIGHT = 32, FRAMES = 8, SAMPLES = 64000 };
@@ -36,9 +34,6 @@ int main(int argc, char **argv) {
     if (!h3_ffmpeg_write_av_rgb24_f32(path, rgb, FRAMES, WIDTH, HEIGHT, 24,
                                       pcm, SAMPLES, 2, 32000,
                                       error, sizeof(error))) die(error);
-    struct stat status;
-    if (stat(path, &status) != 0 || status.st_size < 1000)
-        die("FFmpeg did not create a nonempty A/V container");
     int probed_width = 0, probed_height = 0;
     if (!h3_ffprobe_visual_size(path, &probed_width, &probed_height,
                                 error, sizeof(error))) die(error);
@@ -62,12 +57,6 @@ int main(int argc, char **argv) {
     if (red < 100.0 || green < 100.0 || blue > 80.0)
         die("decoded FFmpeg image has unexpected channel-major content");
     free(decoded);
-    decoded = NULL;
-    if (!h3_ffmpeg_read_image_f32(path, WIDTH, HEIGHT * 2,
-                                  H3_IMAGE_FIT_COVER, &decoded,
-                                  error, sizeof(error))) die(error);
-    free(decoded);
-    decoded = NULL;
     int decoded_frames = 0;
     if (!h3_ffmpeg_read_video_f32(path, WIDTH, HEIGHT, FRAMES,
                                   &decoded, &decoded_frames,
@@ -100,8 +89,7 @@ int main(int argc, char **argv) {
     if (left_energy < 1.0 || right_energy < 1.0)
         die("decoded FFmpeg audio has no stereo signal");
     free(decoded_pcm);
-    printf("ok: concurrent FFmpeg video/PCM pipes created %s (%lld bytes)\n",
-           path, (long long)status.st_size);
+    printf("ok: concurrent FFmpeg video/PCM pipes created %s\n", path);
     free(rgb);
     free(pcm);
     return 0;

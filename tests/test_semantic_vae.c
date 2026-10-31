@@ -17,10 +17,7 @@ enum {
     FRAME_COUNT = 3 * FRAMES * HEIGHT * WIDTH
 };
 
-static void die(const char *message) {
-    fprintf(stderr, "FAIL tests/test_semantic_vae.c: %s\n", message);
-    exit(1);
-}
+#define die(message) do { fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, (message)); exit(1); } while (0)
 
 static float *load_f32(const h3_st_header *header, const char *name,
                        size_t count) {
