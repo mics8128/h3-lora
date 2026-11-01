@@ -825,6 +825,30 @@ int h3_gpu_continue(h3_gpu *opaque) {
     return 1;
 }
 
+int h3_gpu_throttle(h3_gpu *opaque, unsigned max_inflight) {
+    H3GPU *gpu = GPU(opaque);
+    if (!gpu) return 0;
+    @autoreleasepool {
+        while (gpu.inflightCommands.count > max_inflight) {
+            id<MTLCommandBuffer> oldest = gpu.inflightCommands[0];
+            double wait_started = h3_gpu_now();
+            [oldest waitUntilCompleted];
+            if (oldest.status == MTLCommandBufferStatusError) {
+                h3_gpu_set_error(gpu, @"Metal command failed: %@",
+                                 oldest.error.localizedDescription);
+                return 0;
+            }
+            h3_gpu_stats stats = gpu.stats;
+            stats.command_wait_seconds += h3_gpu_now() - wait_started;
+            if (oldest.GPUEndTime >= oldest.GPUStartTime)
+                stats.gpu_seconds += oldest.GPUEndTime - oldest.GPUStartTime;
+            gpu.stats = stats;
+            [gpu.inflightCommands removeObjectAtIndex:0];
+        }
+    }
+    return 1;
+}
+
 int h3_gpu_submit(h3_gpu *opaque) {
     H3GPU *gpu = GPU(opaque);
     if (!gpu || !gpu.command) return 0;

@@ -11,7 +11,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <time.h>
+#include <unistd.h>
 
 enum {
     TEXT_DIM = 5120,
@@ -601,6 +603,18 @@ static double stream_now(void) {
     struct timespec value;
     if (clock_gettime(CLOCK_MONOTONIC, &value) != 0) return 0.0;
     return (double)value.tv_sec + (double)value.tv_nsec * 1e-9;
+}
+
+/* H3_YIELD_FILE names a marker a higher-priority GPU client (the inference
+ * manager) keeps fresh while it runs; a stale marker never pauses H3. */
+static const char *yield_path(void) {
+    const char *path = getenv("H3_YIELD_FILE");
+    return path && *path ? path : NULL;
+}
+
+static int yield_requested(const char *path) {
+    struct stat st;
+    return stat(path, &st) == 0 && time(NULL) - st.st_mtime < 30;
 }
 
 static int compare_stream_sources(const void *left, const void *right) {
@@ -2283,6 +2297,8 @@ static int encode_forward(h3_dit *dit, int step, int begin, int submit,
         unsigned command_blocks = disable_command_split
             ? 0 : command_block_interval(dit);
         if (dit->ssd_streaming) command_blocks = 0;
+        const char *yield = dit->ssd_streaming ? NULL : yield_path();
+        if (yield) command_blocks = 1;
         unsigned completed_blocks = 0;
         int carried_attention_adaln = 0;
         int carried_attention_input_quantized = 0;
@@ -2377,8 +2393,19 @@ static int encode_forward(h3_dit *dit, int step, int begin, int submit,
             completed_blocks++;
             if (command_blocks &&
                 completed_blocks < dit->active_block_count &&
-                completed_blocks % command_blocks == 0)
+                completed_blocks % command_blocks == 0) {
                 OP(h3_gpu_continue(dit->gpu), "continue DiT command chain");
+                /* Finish each block before encoding the next so a pause waits at most one block
+                 * (measured ~3% slower when nothing yields). */
+                if (yield) OP(h3_gpu_throttle(dit->gpu, 0), "throttle DiT command chain");
+                if (yield && yield_requested(yield)) {
+                    OP(h3_gpu_submit(dit->gpu), "drain DiT before GPU yield");
+                    double paused = stream_now();
+                    while (yield_requested(yield)) usleep(50000);
+                    fprintf(stderr, "\nh3: yielded GPU for %.1fs\n", stream_now() - paused);
+                    OP(h3_gpu_begin(dit->gpu), "resume DiT after GPU yield");
+                }
+            }
             if (stream_started) {
                 int gpu_ok = gpu_op(dit, h3_gpu_submit(dit->gpu),
                                     error, error_size,
